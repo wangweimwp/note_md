@@ -41,7 +41,7 @@ CONFIG_KASAN=y
 
 KASAN的原理是利用额外的内存标记可用内存的状态。这部分额外的内存被称作shadow memory（影子区）。KASAN将1/8的内存用作shadow memory。使用特殊的magic num填充shadow memory，在每一次load/store（load/store检查指令由编译器插入）内存的时候检测对应的shadow memory确定操作是否valid。连续8 bytes内存（8 bytes align）使用1 byte shadow memory标记。如果8 bytes内存都可以访问，则shadow memory的值为0；如果连续N(1 =< N <= 7) bytes可以访问，则shadow memory的值为N；如果8 bytes内存访问都是invalid，则shadow memory的值为负数。
 
-![](https://pic3.zhimg.com/80/v2-81e1cb4ee554614b86ee675b6359129e_720w.webp)
+![](./iamge/1.jpg)
 
 在代码运行时，每一次memory access都会检测对应的shawdow memory的值是否valid。这就需要编译器为我们做些工作。编译的时候，在每一次memory access前编译器会帮我们插入__asan_load##size()或者__asan_store##size()函数调用（size是访问内存字节的数量）。这也是要求更新版本gcc的原因，只有更新的版本才支持自动插入。
 
@@ -80,20 +80,20 @@ if (*shadow)
 if (*shadow && *shadow < ((unsigned long)addr & 7) + N); //N = 1,2,4  
 如果*shadow的值为0代表8 bytes均可以访问，自然就不需要report bug。addr & 7是计算访问地址相对于8字节对齐地址的偏移。还是使用下图来说明关系吧。假设内存是从地址8~15一共8 bytes。对应的shadow memory值为5，现在访问11地址。那么这里的N只要大于2就是invalid。
 
-![](https://pic4.zhimg.com/80/v2-aafd2b0062803131b7474865dcaf1cf3_720w.webp)
+![](./iamge/2.JPG)
 
 ### shadow memory内存如何分配？
 
 在ARM64中，假设VA_BITS配置成48。那么kernel space空间大小是256TB，因此shadow memory的内存需要32TB。我们需要在虚拟地址空间为KASAN shadow memory分配地址空间。所以我们有必要了解一下ARM64 memory layout。  
 基于linux-4.15.0-rc3的代码分析，我绘制了如下memory layout（VA_BITS = 48）。kernel space起始虚拟地址是0xffff_0000_0000_0000，kernel space被分成几个部分分别是KASAN、MODULE、VMALLOC、FIXMAP、PCI_IO、VMEMMAP以及linear mapping。其中KASAN的大小是32TB，正好是kernel space大小的1/8。不知道你注意到没有，KERNEL的位置相对以前是不是有所不一样。你的印象中，KERNEL是不是位于linear mapping区域，这里怎么变成了VMALLOC区域？这里是Ard Biesheuvel提交的修改。主要是为了迎接ARM64世界的KASLR（which allows the kernel image to be located anywhere in the vmalloc area）的到来。
 
-![](https://pic3.zhimg.com/80/v2-d0da2b6ee55deb703dcb4eedfa695e7e_720w.webp)
+![](./iamge/3.PNG)
 
 ### 如何建立shadow memory的映射关系？
 
 当打开KASAN的时候，KASAN区域位于kernel space首地址处，从0xffff_0000_0000_0000地址开始，大小是32TB。shadow memory和kernel address转换关系是：shadow_addr = (kaddr >> 3) + KASAN_SHADOW_OFFSE。为了将[0xffff_0000_0000_0000, 0xffff_ffff_ffff_ffff]和[0xffff_0000_0000_0000, 0xffff_1fff_ffff_ffff]对应起来，因此计算KASAN_SHADOW_OFFSE的值为0xdfff_2000_0000_0000。我们将KASAN区域放大，如下图所示。
 
-![](https://pic4.zhimg.com/80/v2-cef1381b35d70786adc7bc161b5aff27_720w.webp)
+![](./iamge/4.PNG)
 
 KASAN区域仅仅是分配的虚拟地址，在访问的时候必须建立和物理地址的映射才可以访问。上图就是KASAN建立的映射布局。左边是系统启动初期建立的映射。在kasan_early_init()函数中，将所有的KASAN区域映射到kasan_zero_page物理页面。因此系统启动初期，KASAN并不能工作。右侧是在kasan_init()函数中建立的映射关系，kasan_init()函数执行结束就预示着KASAN的正常工作。我们将不需要address sanitizer功能的区域同样还是映射到kasan_zero_page物理页面，并且是readonly。我们主要是检测kernel和物理内存是否存在UAF或者OOB问题。所以建立KERNEL和linear mapping（仅仅是所有的物理地址建立的映射区域）区域对应的shadow memory建立真实的映射关系。MOUDLE区域对应的shadow memory的映射关系也是需要创建的，但是映射关系建立是动态的，他在module加载的时候才会去创建映射关系。
 
@@ -101,13 +101,13 @@ KASAN区域仅仅是分配的虚拟地址，在访问的时候必须建立和物
 
 既然shadow memory已经建立映射，接下来的事情就是探究各种内存分配器向shadow memory填充什么数据了。首先看一下伙伴系统allocate page(s)函数填充shadow memory情况。
 
-![](https://pic3.zhimg.com/80/v2-501e7734c04195794560a8ecc1c09c52_720w.webp)
+![](./iamge/5.PNG)
 
 假设我们从buddy system分配4 pages。系统首先从order=2的链表中摘下一块内存，然后根据shadow memory address和memory address之间的对应的关系找对应的shadow memory。这里shadow memory的大小将会是2KB，系统会全部填充0代表内存可以访问。我们对分配的内存的任意地址内存进行访问的时候，首先都会找到对应的shadow memory，然后根据shadow memory value判断访问内存操作是否valid。
 
 如果释放pages，情况又是如何呢？
 
-![](https://pic3.zhimg.com/80/v2-66b6269c46e455dffaa9a76a105a166a_720w.webp)
+![](./iamge/6.PNG)
 
 同样的，当释放pages的时候，会填充shadow memory的值为0xFF。如果释放之后，依然访问内存的话，此时KASAN根据shadow memory的值是0xFF就可以断，这是一个use-after-free问题。
 
@@ -115,23 +115,23 @@ KASAN区域仅仅是分配的虚拟地址，在访问的时候必须建立和物
 
 当我们打开KASAN的时候，SLUB Allocator管理的object layout将会放生一定的变化。如下图所示。
 
-![](https://pic3.zhimg.com/80/v2-14d9ca2e25d83cb4a17c4ab0d9659b02_720w.webp)
+![](./iamge/7.PNG)
 
 在打开SLUB_DEBUG的时候，object就增加很多内存，KASAN打开之后，在此基础上又加了一截。为什么这里必须打开SLUB_DEBUG呢？是因为有段时间KASAN是依赖SLUBU_DEBUG的，什么意思呢？就是在Kconfig中使用了depends on，明白了吧。不过最新的代码已经不需要依赖了，可以看下提交。
 
 当我们第一次创建slab缓存池的时候，系统会调用kasan_poison_slab()函数初始化shadow memory为下图的模样。整个slab对应的shadow memory都填充0xFC。
 
-![](https://pic3.zhimg.com/80/v2-97826a0b85ede74533ebecece9424292_720w.webp)
+![](./iamge/8.PNG)
 
 上述步骤虽然填充了0xFC，但是接下来初始化object的时候，会改变一些shadow memory的值。我们先看一下kmalloc(20)的情况。我们知道kmalloc()就是基于SLUB Allocator实现的，所以会从kmalloc-32的kmem_cache中分配一个32 bytes object。
 
-![](https://pic1.zhimg.com/80/v2-019e6340903d8174628dc274c7c38c68_720w.webp)
+![](./iamge/9.PNG)
 
 首先调用kmalloc(20)函数会匹配到kmalloc-32的kmem_cache，因此实际分配的object大小是32 bytes。KASAN同样会标记剩下的12 bytes的shadow memory为不可访问状态。根据object的地址，计算shadow memory的地址，并开始填充数值。由于kmalloc()返回的object的size是32 bytes，由于kmalloc(20)只申请了20 bytes，剩下的12 bytes不能使用。KASAN必须标记shadow memory这种情况。object对应的4 bytes shadow memory分别填充00 00 04 FC。00代表8个连续的字节可以访问。04代表前4个字节可以访问。作为越界访问的检测的方法。总共加在一起是正好是20 bytes可访问。0xFC是Redzone标记。如果访问了Redzone区域KASAN就会检测out-of-bounds的发生。
 
 当申请使用之后，现在调用kfree()释放之后的shadow memory情况是怎样的呢？看下图。
 
-![](https://pic3.zhimg.com/80/v2-c6d6dc6e0fa10527d8d644c9b376b026_720w.webp)
+![](./iamge/10.PNG)
 
 根据object首地址找到对应的shadow memory，32 bytes object对应4 bytes的shadow memory，现在填充0xFB标记内存是释放的状态。此时如果继续访问object，那么根据shadow memory的状态值既可以确定是use-after-free问题。
 
@@ -152,7 +152,7 @@ struct {
 
 另外从我的测试发现，如果上述的数组a的大小是33的时候，填充的redzone就是63 bytes。所以我推测，填充的原理是这样的。全局变量实际占用内存总数S（以byte为单位）按照每块32 bytes平均分成N块。假设最后一块内存距离目标32 bytes还差y bytes（if S%32 == 0，y = 0），那么redzone填充的大小就是(y + 32) bytes。画图示意如下（S%32 != 0）。因此总结的规律是：redzone = 63 – (S - 1) % 32。
 
-![](https://pic2.zhimg.com/80/v2-ed3295a7ea8e2a7b3a6ad5c15eec1c0d_720w.webp)
+![](./iamge/11.PNG)
 
 全局变量redzone区域对应的shadow memory是在什么填充的呢？又是如何调用的呢？这部分是由编译器帮我们完成的。编译器会为每一个全局变量创建一个函数，函数名称是：_GLOBAL__sub_I_65535_1_##global_variable_name。这个函数中通过调用__asan_register_globals()函数完成shadow memory标记。并且将自动生成的这个函数的首地址放在.init_array段。在kernel启动阶段，通过以下代调用关系最终调用所有全局变量的构造函数。kernel_init_freeable()->do_basic_setup() ->do_ctors()。do_ctors()代码实现如下：
 
@@ -178,7 +178,7 @@ static void __init do_ctors(void)
 
 上面说了这么多，不知道你是否产生了疑心？怎么都是猜啊！猜的能准确吗？是的，我也这么觉得。是骡子是马，拉出来溜溜呗！现在用事实说话。首先我创建一个c文件drivers/input/smc.c。在smc.c文件中创建3个全局变量如下：
 
-![](https://pic2.zhimg.com/80/v2-7326f984053b182004defbf2e0434e81_720w.webp)
+![](./iamge/12.PNG)
 
 然后就随便使用吧！编译kernel，我们先看看System.map文件中，3个全局变量分配的地址。
 
@@ -291,7 +291,7 @@ ffff2000093ae0c0 f01d3809 0020ffff 181e3809 0020ffff
 
 现在就剩下__asan_register_globals()函数到底是是怎么初始化shadow memory的呢？以char a[4]为例，如下图所示。
 
-![](https://pic4.zhimg.com/80/v2-1217da923ebb28f8a4ecb3544c93359b_720w.webp)
+![](./iamge/13.PNG)
 
 a[4]只有4 bytes可以访问，所以对应的shadow memory的第一个byte值是4，后面的redzone就填充0xFA作为越界检测。a[4]只有4 bytes可以访问，所以对应的shadow memory的第一个byte值是4，后面的redzone就填充0xFA作为越界检测。因为这里是全局变量，因此分配的内存区域位于kernel区域。
 

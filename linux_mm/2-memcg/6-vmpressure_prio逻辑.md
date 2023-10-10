@@ -1,5 +1,4 @@
 ```c
-
 /*
  * The window size (vmpressure_win) is the number of scanned pages before
  * we try to analyze scanned/reclaimed ratio. So the window is used as a
@@ -41,9 +40,9 @@ static const unsigned int vmpressure_level_critical_prio = ilog2(100 / 10) = log
 
 /**
  * vmpressure_prio() - Account memory pressure through reclaimer priority level
- * @gfp:	reclaimer's gfp mask
- * @memcg:	cgroup memory controller handle
- * @prio:	reclaimer's priority
+ * @gfp:    reclaimer's gfp mask
+ * @memcg:    cgroup memory controller handle
+ * @prio:    reclaimer's priority
  *
  * This function should be called from the reclaim path every time when
  * the vmscan's reclaiming priority (scanning depth) changes.
@@ -52,30 +51,30 @@ static const unsigned int vmpressure_level_critical_prio = ilog2(100 / 10) = log
  */
 void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio)
 {
-	/*
-	 * We only use prio for accounting critical level. For more info
-	 * see comment for vmpressure_level_critical_prio variable above.
-	 */
-	if (prio > vmpressure_level_critical_prio)//大于3
-		return;
+    /*
+     * We only use prio for accounting critical level. For more info
+     * see comment for vmpressure_level_critical_prio variable above.
+     */
+    if (prio > vmpressure_level_critical_prio)//大于3
+        return;
 
-	/*
-	 * OK, the prio is below the threshold, updating vmpressure
-	 * information before shrinker dives into long shrinking of long
-	 * range vmscan. Passing scanned = vmpressure_win, reclaimed = 0
-	 * to the vmpressure() basically means that we signal 'critical'
-	 * level.
-	 */
-	vmpressure(gfp, memcg, true, vmpressure_win, 0);
+    /*
+     * OK, the prio is below the threshold, updating vmpressure
+     * information before shrinker dives into long shrinking of long
+     * range vmscan. Passing scanned = vmpressure_win, reclaimed = 0
+     * to the vmpressure() basically means that we signal 'critical'
+     * level.
+     */
+    vmpressure(gfp, memcg, true, vmpressure_win, 0);
 }
 
 /**
  * vmpressure() - Account memory pressure through scanned/reclaimed ratio
- * @gfp:	reclaimer's gfp mask
- * @memcg:	cgroup memory controller handle
- * @tree:	legacy subtree mode
- * @scanned:	number of pages scanned
- * @reclaimed:	number of pages reclaimed
+ * @gfp:    reclaimer's gfp mask
+ * @memcg:    cgroup memory controller handle
+ * @tree:    legacy subtree mode
+ * @scanned:    number of pages scanned
+ * @reclaimed:    number of pages reclaimed
  *
  * This function should be called from the vmscan reclaim path to account
  * "instantaneous" memory pressure (scanned/reclaimed ratio). The raw
@@ -91,81 +90,79 @@ void vmpressure_prio(gfp_t gfp, struct mem_cgroup *memcg, int prio)
  * This function does not return any value.
  */
 void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
-		unsigned long scanned, unsigned long reclaimed)
-{	//gfp = GFP_KERNEL 是do_anonymous_page传进来的
-	struct vmpressure *vmpr;
+        unsigned long scanned, unsigned long reclaimed)
+{    //gfp = GFP_KERNEL 是do_anonymous_page传进来的
+    struct vmpressure *vmpr;
 
-	if (mem_cgroup_disabled())
-		return;
+    if (mem_cgroup_disabled())
+        return;
 
-	vmpr = memcg_to_vmpressure(memcg);
+    vmpr = memcg_to_vmpressure(memcg);
 
-	/*
-	 * Here we only want to account pressure that userland is able to
-	 * help us with. For example, suppose that DMA zone is under
-	 * pressure; if we notify userland about that kind of pressure,
-	 * then it will be mostly a waste as it will trigger unnecessary
-	 * freeing of memory by userland (since userland is more likely to
-	 * have HIGHMEM/MOVABLE pages instead of the DMA fallback). That
-	 * is why we include only movable, highmem and FS/IO pages.
-	 * Indirect reclaim (kswapd) sets sc->gfp_mask to GFP_KERNEL, so
-	 * we account it too.
-	 */
-	if (!(gfp & (__GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)))
-		return;
+    /*
+     * Here we only want to account pressure that userland is able to
+     * help us with. For example, suppose that DMA zone is under
+     * pressure; if we notify userland about that kind of pressure,
+     * then it will be mostly a waste as it will trigger unnecessary
+     * freeing of memory by userland (since userland is more likely to
+     * have HIGHMEM/MOVABLE pages instead of the DMA fallback). That
+     * is why we include only movable, highmem and FS/IO pages.
+     * Indirect reclaim (kswapd) sets sc->gfp_mask to GFP_KERNEL, so
+     * we account it too.
+     */
+    if (!(gfp & (__GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)))
+        return;
 
-	/*
-	 * If we got here with no pages scanned, then that is an indicator
-	 * that reclaimer was unable to find any shrinkable LRUs at the
-	 * current scanning depth. But it does not mean that we should
-	 * report the critical pressure, yet. If the scanning priority
-	 * (scanning depth) goes too high (deep), we will be notified
-	 * through vmpressure_prio(). But so far, keep calm.
-	 */
-	if (!scanned)
-		return;
+    /*
+     * If we got here with no pages scanned, then that is an indicator
+     * that reclaimer was unable to find any shrinkable LRUs at the
+     * current scanning depth. But it does not mean that we should
+     * report the critical pressure, yet. If the scanning priority
+     * (scanning depth) goes too high (deep), we will be notified
+     * through vmpressure_prio(). But so far, keep calm.
+     */
+    if (!scanned)
+        return;
 
-	if (tree) {
-		spin_lock(&vmpr->sr_lock);
-		scanned = vmpr->tree_scanned += scanned;
-		vmpr->tree_reclaimed += reclaimed;
-		spin_unlock(&vmpr->sr_lock);
+    if (tree) {
+        spin_lock(&vmpr->sr_lock);
+        scanned = vmpr->tree_scanned += scanned;
+        vmpr->tree_reclaimed += reclaimed;
+        spin_unlock(&vmpr->sr_lock);
 
-		if (scanned < vmpressure_win)
-			return;
-		schedule_work(&vmpr->work);
-	} else {
-		enum vmpressure_levels level;
+        if (scanned < vmpressure_win)
+            return;
+        schedule_work(&vmpr->work);
+    } else {
+        enum vmpressure_levels level;
 
-		/* For now, no users for root-level efficiency */
-		if (!memcg || mem_cgroup_is_root(memcg))
-			return;
+        /* For now, no users for root-level efficiency */
+        if (!memcg || mem_cgroup_is_root(memcg))
+            return;
 
-		spin_lock(&vmpr->sr_lock);
-		scanned = vmpr->scanned += scanned;
-		reclaimed = vmpr->reclaimed += reclaimed;
-		if (scanned < vmpressure_win) {
-			spin_unlock(&vmpr->sr_lock);
-			return;
-		}
-		vmpr->scanned = vmpr->reclaimed = 0;
-		spin_unlock(&vmpr->sr_lock);
+        spin_lock(&vmpr->sr_lock);
+        scanned = vmpr->scanned += scanned;
+        reclaimed = vmpr->reclaimed += reclaimed;
+        if (scanned < vmpressure_win) {
+            spin_unlock(&vmpr->sr_lock);
+            return;
+        }
+        vmpr->scanned = vmpr->reclaimed = 0;
+        spin_unlock(&vmpr->sr_lock);
 
-		level = vmpressure_calc_level(scanned, reclaimed);
+        level = vmpressure_calc_level(scanned, reclaimed);
 
-		if (level > VMPRESSURE_LOW) {
-			/*
-			 * Let the socket buffer allocator know that
-			 * we are having trouble reclaiming LRU pages.
-			 *
-			 * For hysteresis keep the pressure state
-			 * asserted for a second in which subsequent
-			 * pressure events can occur.
-			 */
-			WRITE_ONCE(memcg->socket_pressure, jiffies + HZ);
-		}
-	}
+        if (level > VMPRESSURE_LOW) {
+            /*
+             * Let the socket buffer allocator know that
+             * we are having trouble reclaiming LRU pages.
+             *
+             * For hysteresis keep the pressure state
+             * asserted for a second in which subsequent
+             * pressure events can occur.
+             */
+            WRITE_ONCE(memcg->socket_pressure, jiffies + HZ);
+        }
+    }
 }
 ```
-
-

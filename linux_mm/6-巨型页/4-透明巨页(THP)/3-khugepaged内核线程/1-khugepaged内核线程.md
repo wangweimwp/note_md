@@ -2,10 +2,6 @@
 
 `cc->is_khugepaged` 表明是否在khugepaged内核线程
 
-
-
 ```c
 
 ```
-
-

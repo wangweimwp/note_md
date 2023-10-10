@@ -6,11 +6,7 @@
 
 （3）配置宏CONFIG_DMA_CMA，启用允许设备驱动分配内存的连续内存分配器。
 
-
-
 CMA区域分为全局CMA区域和设备私有CMA区域。全局CMA区域是由所有设备驱动共享的，设备私有CMA区域由指定的一个或多个设备驱动使用。
-
-
 
 <mark>**配置CMA区域有3种方法：**</mark>
 
@@ -22,15 +18,9 @@ CMA区域分为全局CMA区域和设备私有CMA区域。全局CMA区域是由�
 
 首先选择指定大小的方式：CONFIG_CMA_SIZE_SEL_MBYTES表示指定兆字节数，CONFIG_CMA_SIZE_SEL_PERCENTAGE表示指定物理内存容量的百分比，默认使用指定兆字节数的方式。
 
-
-
 如果选择指定兆字节数的方式，那么通过配置宏CONFIG_CMA_SIZE_MBYTES配置大小。如果配置为0，表示禁止CMA，但是可以传递内核参数“cma=nn[MG]”以启用CMA。
 
-
-
 如果选择指定物理内存容量的百分比的方式，那么通过配置宏CONFIG_CMA_SIZE_PERCENTAGE指定百分比。如果配置为0，表示禁用连续内存分配器，但是可以传递内核参数“cma=nn[MG]”以启用连续内存分配器。
-
-
 
 **（3）通过设备树源文件的节点“/reserved-memory”配置CMA区域，如果子节点的属性“compatible”的值是“shared-dma-pool”，表示全局CMA区域，否则表示设备私有CMA区域。**
 
@@ -41,8 +31,6 @@ CMA区域分为全局CMA区域和设备私有CMA区域。全局CMA区域是由�
 2）帧缓冲设备专用的CMA区域，节点名称是“framebuffer@78000000”，大小是8MB。
 
 3）多媒体处理专用的CMA区域，节点名称是“multimedia-memory@77000000”，大小是64MB。
-
-
 
 **问题1：确定CMA内存所在的zone（问问夏老板）**
 

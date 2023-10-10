@@ -4,7 +4,7 @@ folio_alloc
         ->__folio_alloc
 ```
 
-![](C:\Users\wangwei180\AppData\Roaming\marktext\images\2023-10-07-17-04-08-image.png)
+![](./image/7.PNG)
 
 ```c
 alloc_pages
