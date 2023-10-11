@@ -508,3 +508,7 @@ Memory state around the buggy address:
 - line51：访问出问题的地址位于object起始地址偏移123 bytes的位置。object的地址范围是[0xffffffc0cb114d00, 0xffffffc0cb114d80)。object实际大小是128 bytes。  
 
 - line61：出问题地址对应的shadow memory的值，可以确定申请内存的实际大小是123 bytes。
+  
+  **对比**
+
+和 KASan 功能类似的工具还有 kmemcheck，它比 KASan 更早加入内核，但是运行速度没有 KASan 快，这是因为 KASan 利用了编译器的特性，可以将代码编译为內联模式。但 KASan 也有自己的不足，目前 KASan 不能检测出读取未初始化内存的错误，而这一点 kmemcheck 是支持的。
