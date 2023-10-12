@@ -235,8 +235,47 @@ static void kmemleak_scan(void)
 
 扫描主要通过 `scan_block` 函数进行，我们来看看 `scan_block` 函数的实现：
 
-```
-static voidscan_block(void *_start, void *_end, struct kmemleak_object *scanned,           int allow_resched){    unsigned long *ptr;    unsigned long *start = PTR_ALIGN(_start, BYTES_PER_POINTER);    unsigned long *end = _end - (BYTES_PER_POINTER - 1);    // 对内存区进行扫描    for (ptr = start; ptr < end; ptr++) {        struct kmemleak_object *object;        unsigned long flags;        unsigned long pointer;        ...        pointer = *ptr;        // 查找指针所引用的内存块是否存在于红黑树中，如果不存在就跳过此指针        object = find_and_get_object(pointer, 1);        if (!object)            continue;        ...        // 如果对象不是白色，说明此内存块已经被指针引用        if (!color_white(object)) {            ...            continue;        }        // 对 kmemleak_object 对象的count字段进行加一操作        object->count++;        // 判断当前对象是否灰色节点，如果是将其添加到灰色节点链表中        if (color_gray(object)) {            list_add_tail(&object->gray_list, &gray_list);            ...            continue;        }        ...    }}
+```c
+static void
+scan_block(void *_start, void *_end, struct kmemleak_object *scanned,
+           int allow_resched)
+{
+    unsigned long *ptr;
+    unsigned long *start = PTR_ALIGN(_start, BYTES_PER_POINTER);
+    unsigned long *end = _end - (BYTES_PER_POINTER - 1);
+
+    // 对内存区进行扫描
+    for (ptr = start; ptr < end; ptr++) {
+        struct kmemleak_object *object;
+        unsigned long flags;
+        unsigned long pointer;
+        ...
+
+        pointer = *ptr;
+
+        // 查找指针所引用的内存块是否存在于红黑树中，如果不存在就跳过此指针
+        object = find_and_get_object(pointer, 1);
+        if (!object)
+            continue;
+        ...
+        // 如果对象不是白色，说明此内存块已经被指针引用
+        if (!color_white(object)) {
+            ...
+            continue;
+        }
+
+        // 对 kmemleak_object 对象的count字段进行加一操作
+        object->count++;
+
+        // 判断当前对象是否灰色节点，如果是将其添加到灰色节点链表中
+        if (color_gray(object)) {
+            list_add_tail(&object->gray_list, &gray_list);
+            ...
+            continue;
+        }
+        ...
+    }
+}
 ```
 
 `scan_block` 函数主要完成以下几个步骤：
