@@ -8,17 +8,24 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 
 `swapon`系统调用调用`init_swap_address_space`，初始化`struct address_space->a_ops = & swap_aops`,后续kswap线程向swap分区回写数据时会调用
 
-
-
 ## 回写
 
-内存紧张时，
+内存紧张时，`shrink_folio_list->pageout`调用`mapping->a_ops->writepage`方法回写页面，在swap_state.c文件中，（Only kswapd can writeback filesystem pages 留意`page_is_file_cache`）
 
 ```c
-shrink_inactive_list中if (stat.nr_unqueued_dirty == nr_taken)成立
-    ->wakeup_flusher_threads(WB_REASON_VMSCAN)唤醒writeback回写进程
-```
+static const struct address_space_operations swap_aops = {
+    .writepage    = swap_writepage,
+    .dirty_folio    = noop_dirty_folio,
+#ifdef CONFIG_MIGRATION
+    .migrate_folio    = migrate_folio,
+#endif
+};
 
-`wakeup_flusher_threads`会唤醒虽有文件系统的数据回写，内核使用delay work（延时工作队列）实现文件系统的数据回写
+->__swap_writepage
+	->swap_writepage_bdev_async
+		->set_page_writeback
+
+
+```
 
 
