@@ -9,18 +9,53 @@
 shrink_inactive_list->lru_note_cost
 shrink_active_list->lru_note_cost
 workingset_refault->lru_note_cost_refault
+```
+
+**记录lru列表上的evictions和activations次数**
+
+对于每个内存节点的LRU链表，维护一个计数器(`lruvec->nonresident_age`),当有page读入时，都有可能增加计数
+
+```c
 
 
+//页面被加入active列表
+move_folios_to_lru
+	->if (folio_test_active(folio))
+			workingset_age_nonresident();
+//页面被eviction时
+shrink_folio_list			
+  ->__remove_mapping
+	    ->workingset_eviction
+		    ->workingset_age_nonresident();
+		
+workingset_activation
+	->workingset_age_nonresident
+
+__read_swap_cache_async
+	->workingset_refault
+		->workingset_age_nonresident();
+	
+handle_pte_fault
+	->do_swap_page
+		->workingset_refault
+			->workingset_age_nonresident();
+	->swapin_readahead
+		->swap_vma_readahead
+			->__read_swap_cache_async
+				->workingset_refault
+					->workingset_age_nonresident();
+					
+filemap_add_folio
+	->workingset_refault
+		->workingset_age_nonresident();	
+
+folio_mark_accessed
+	->workingset_activation
+		->workingset_age_nonresident();
 ```
 
 
 
+**当page cache从inactive上evictions时**
 
-
-
-
-
-
-
-
-
+`shrink_folio_list->__remove_mapping->workingset_eviction`记录页面第一次evictions时的`nonresident_age`值，
