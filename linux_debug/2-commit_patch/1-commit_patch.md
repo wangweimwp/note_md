@@ -13,8 +13,6 @@ git config --get-all user.name
 git config --get-all user.email
 ```
 
-
-
 - 配置smtp
 
 ```bash
@@ -38,6 +36,7 @@ vi ~/.gitconfig
 git add .
 git status
 git commit -s -v
+
 ```
 
 Commit 信息的格式有严格限制
@@ -63,7 +62,6 @@ git format-patch  --subject-prefix='PATCH'  -1
 Andrew Morton <akpm@linux-foundation.org> (maintainer:MEMORY MANAGEMENT)
 linux-mm@kvack.org (open list:MEMORY MANAGEMENT)
 linux-kernel@vger.kernel.org (open list)
-
 ```
 
 - 发送邮件
@@ -71,7 +69,4 @@ linux-kernel@vger.kernel.org (open list)
 ```bash
 #给自己发送测试
 git send-email --smtp-debug --to=a929233872@163.com,929244872@qq.com --cc=929244872@qq.com 0001-mm-fix-some-error.patch
-
 ```
-
-
