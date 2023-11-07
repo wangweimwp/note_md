@@ -207,8 +207,6 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 }
 ```
 
-
-
 **workingset_refault代码分析**
 
 ```c
@@ -223,129 +221,127 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
  */
 void workingset_refault(struct folio *folio, void *shadow)
 {
-	bool file = folio_is_file_lru(folio);
-	struct mem_cgroup *eviction_memcg;
-	struct lruvec *eviction_lruvec;
-	unsigned long refault_distance;
-	unsigned long workingset_size;
-	struct pglist_data *pgdat;
-	struct mem_cgroup *memcg;
-	unsigned long eviction;
-	struct lruvec *lruvec;
-	unsigned long refault;
-	bool workingset;
-	int memcgid;
-	long nr;
+    bool file = folio_is_file_lru(folio);
+    struct mem_cgroup *eviction_memcg;
+    struct lruvec *eviction_lruvec;
+    unsigned long refault_distance;
+    unsigned long workingset_size;
+    struct pglist_data *pgdat;
+    struct mem_cgroup *memcg;
+    unsigned long eviction;
+    struct lruvec *lruvec;
+    unsigned long refault;
+    bool workingset;
+    int memcgid;
+    long nr;
 
-	if (lru_gen_enabled()) {
-		lru_gen_refault(folio, shadow);
-		return;
-	}
+    if (lru_gen_enabled()) {
+        lru_gen_refault(folio, shadow);
+        return;
+    }
 
-	unpack_shadow(shadow, &memcgid, &pgdat, &eviction, &workingset);
-	eviction <<= bucket_order;
+    unpack_shadow(shadow, &memcgid, &pgdat, &eviction, &workingset);
+    eviction <<= bucket_order;
 
-	rcu_read_lock();
-	/*
-	 * Look up the memcg associated with the stored ID. It might
-	 * have been deleted since the folio's eviction.
-	 *
-	 * Note that in rare events the ID could have been recycled
-	 * for a new cgroup that refaults a shared folio. This is
-	 * impossible to tell from the available data. However, this
-	 * should be a rare and limited disturbance, and activations
-	 * are always speculative anyway. Ultimately, it's the aging
-	 * algorithm's job to shake out the minimum access frequency
-	 * for the active cache.
-	 *
-	 * XXX: On !CONFIG_MEMCG, this will always return NULL; it
-	 * would be better if the root_mem_cgroup existed in all
-	 * configurations instead.
-	 */
-	eviction_memcg = mem_cgroup_from_id(memcgid);
-	if (!mem_cgroup_disabled() && !eviction_memcg)
-		goto out;
-	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
-	refault = atomic_long_read(&eviction_lruvec->nonresident_age);
+    rcu_read_lock();
+    /*
+     * Look up the memcg associated with the stored ID. It might
+     * have been deleted since the folio's eviction.
+     *
+     * Note that in rare events the ID could have been recycled
+     * for a new cgroup that refaults a shared folio. This is
+     * impossible to tell from the available data. However, this
+     * should be a rare and limited disturbance, and activations
+     * are always speculative anyway. Ultimately, it's the aging
+     * algorithm's job to shake out the minimum access frequency
+     * for the active cache.
+     *
+     * XXX: On !CONFIG_MEMCG, this will always return NULL; it
+     * would be better if the root_mem_cgroup existed in all
+     * configurations instead.
+     */
+    eviction_memcg = mem_cgroup_from_id(memcgid);
+    if (!mem_cgroup_disabled() && !eviction_memcg)
+        goto out;
+    eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+    refault = atomic_long_read(&eviction_lruvec->nonresident_age);
 
-	/*
-	 * Calculate the refault distance
-	 *
-	 * The unsigned subtraction here gives an accurate distance
-	 * across nonresident_age overflows in most cases. There is a
-	 * special case: usually, shadow entries have a short lifetime
-	 * and are either refaulted or reclaimed along with the inode
-	 * before they get too old.  But it is not impossible for the
-	 * nonresident_age to lap a shadow entry in the field, which
-	 * can then result in a false small refault distance, leading
-	 * to a false activation should this old entry actually
-	 * refault again.  However, earlier kernels used to deactivate
-	 * unconditionally with *every* reclaim invocation for the
-	 * longest time, so the occasional inappropriate activation
-	 * leading to pressure on the active list is not a problem.
-	 */
-	refault_distance = (refault - eviction) & EVICTION_MASK;//计算refault_distance
+    /*
+     * Calculate the refault distance
+     *
+     * The unsigned subtraction here gives an accurate distance
+     * across nonresident_age overflows in most cases. There is a
+     * special case: usually, shadow entries have a short lifetime
+     * and are either refaulted or reclaimed along with the inode
+     * before they get too old.  But it is not impossible for the
+     * nonresident_age to lap a shadow entry in the field, which
+     * can then result in a false small refault distance, leading
+     * to a false activation should this old entry actually
+     * refault again.  However, earlier kernels used to deactivate
+     * unconditionally with *every* reclaim invocation for the
+     * longest time, so the occasional inappropriate activation
+     * leading to pressure on the active list is not a problem.
+     */
+    refault_distance = (refault - eviction) & EVICTION_MASK;//计算refault_distance
 
-	/*
-	 * The activation decision for this folio is made at the level
-	 * where the eviction occurred, as that is where the LRU order
-	 * during folio reclaim is being determined.
-	 *
-	 * However, the cgroup that will own the folio is the one that
-	 * is actually experiencing the refault event.
+    /*
+     * The activation decision for this folio is made at the level
+     * where the eviction occurred, as that is where the LRU order
+     * during folio reclaim is being determined.
+     *
+     * However, the cgroup that will own the folio is the one that
+     * is actually experiencing the refault event.
      * 计算refault distance 要考虑folio属于哪个memcg
-	 */
-	nr = folio_nr_pages(folio);
-	memcg = folio_memcg(folio);
-	pgdat = folio_pgdat(folio);
-	lruvec = mem_cgroup_lruvec(memcg, pgdat);
+     */
+    nr = folio_nr_pages(folio);
+    memcg = folio_memcg(folio);
+    pgdat = folio_pgdat(folio);
+    lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
-	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + file, nr);
+    mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + file, nr);
 
-	mem_cgroup_flush_stats_delayed();
-	/*
-	 * Compare the distance to the existing workingset size. We
-	 * don't activate pages that couldn't stay resident even if
-	 * all the memory was available to the workingset. Whether
-	 * workingset competition needs to consider anon or not depends
-	 * on having swap.
+    mem_cgroup_flush_stats_delayed();
+    /*
+     * Compare the distance to the existing workingset size. We
+     * don't activate pages that couldn't stay resident even if
+     * all the memory was available to the workingset. Whether
+     * workingset competition needs to consider anon or not depends
+     * on having swap.
      * 是否考虑anon页面取决于是都拥有swap分区
-	 */
-	workingset_size = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
-	if (!file) {
-		workingset_size += lruvec_page_state(eviction_lruvec,
-						     NR_INACTIVE_FILE);
-	}
-	if (mem_cgroup_get_nr_swap_pages(eviction_memcg) > 0) {
-		workingset_size += lruvec_page_state(eviction_lruvec,
-						     NR_ACTIVE_ANON);
-		if (file) {
-			workingset_size += lruvec_page_state(eviction_lruvec,
-						     NR_INACTIVE_ANON);
-		}
-	}
-	if (refault_distance > workingset_size)
-		goto out;
+     */
+    workingset_size = lruvec_page_state(eviction_lruvec, NR_ACTIVE_FILE);
+    if (!file) {
+        workingset_size += lruvec_page_state(eviction_lruvec,
+                             NR_INACTIVE_FILE);
+    }
+    if (mem_cgroup_get_nr_swap_pages(eviction_memcg) > 0) {
+        workingset_size += lruvec_page_state(eviction_lruvec,
+                             NR_ACTIVE_ANON);
+        if (file) {
+            workingset_size += lruvec_page_state(eviction_lruvec,
+                             NR_INACTIVE_ANON);
+        }
+    }
+    if (refault_distance > workingset_size)
+        goto out;
 
-	folio_set_active(folio);//refault_distance <= workingset_size,可以放到actice列表
-	workingset_age_nonresident(lruvec, nr);
-	mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, nr);
+    folio_set_active(folio);//refault_distance <= workingset_size,可以放到actice列表
+    workingset_age_nonresident(lruvec, nr);
+    mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file, nr);
 
-	/* Folio was active prior to eviction */
-	if (workingset) {
-		folio_set_workingset(folio);
-		/*
-		 * XXX: Move to folio_add_lru() when it supports new vs
-		 * putback
-		 */
-		lru_note_cost_refault(folio);
-		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
-	}
+    /* Folio was active prior to eviction */
+    if (workingset) {
+        folio_set_workingset(folio);
+        /*
+         * XXX: Move to folio_add_lru() when it supports new vs
+         * putback
+         */
+        lru_note_cost_refault(folio);
+        mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file, nr);
+    }
 out:
-	rcu_read_unlock();
+    rcu_read_unlock();
 }
-
-
 ```
 
 #### **PG_workingset flags含义和使用**
@@ -359,14 +355,11 @@ shrink_active_list
 
 workingset_refault
     ->if (workingset) {
-		    folio_set_workingset(folio)
+            folio_set_workingset(folio)
       }
 ```
 
-
-
 内核需要区分是否是thrashing的情况：我们知道workingset算法同时保护anon和file page之后，这两个page生成时都是加入了inactive list当中，第一种情况：这种page直接被eviction之后，再次读取触发refault，这种情况仅仅称为transition；第二个种情况是说：如果内核判定refault distance加入了active list，之后老化被回收，再次access触发的refault就叫做thrashing。内核怎么区分两种情况呢？第二种情况明显是加入过active list，所以shrink_active_list内核就设置PageWorkingSet区分两种情况，nice!!!!
-
 
 对PG_workingset的判定后，只要有2种操作
 
@@ -374,19 +367,15 @@ workingset_refault
 //仅存在MGLRU中
 evict_folios
     ->if (folio_test_workingset(folio))
-				folio_set_referenced(folio);
+                folio_set_referenced(folio);
 
 //在文件系统中  记录memstall事件？？？
 bool workingset = folio_test_workingset(folio);
-	if (unlikely(workingset))
-		psi_memstall_enter(&pflags)
+    if (unlikely(workingset))
+        psi_memstall_enter(&pflags)    //标记当前task由于内存不足而被阻塞
 
     ......
 
     if (unlikely(workingset))
-		psi_memstall_leave(&pflags);
-
-
+        psi_memstall_leave(&pflags);
 ```
-
-
