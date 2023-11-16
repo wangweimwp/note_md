@@ -14,13 +14,9 @@
 
 3，只处理匿名页面
 
-
-
 **数据结构**
 
 ![](./image/3.JPG)
-
-
 
 **代码分析**
 
@@ -28,6 +24,9 @@
 ksm_madvise
     ->__ksm_enter    //从mm_slot_cache申请内存，存放进程的struct mm，并添加到ksm_scan.mm_slot->slot.mm_node列表上
         ->wake_up_interruptible(&ksm_thread_wait);//唤醒ksm_do_scan进程
+
+
+
 
 
 /**
@@ -151,7 +150,7 @@ next_mm:
                     ksm_scan.rmap_list, ksm_scan.address);
                 if (rmap_item) {
                     ksm_scan.rmap_list =
-                            &rmap_item->rmap_list;
+                            &rmap_item->rmap_list;//向后移动一个，指向下次要扫描的rmap_item
                     ksm_scan.address += PAGE_SIZE;
                 } else
                     put_page(*page);
@@ -173,7 +172,8 @@ no_vmas:
     /*
      * Nuke all the rmap_items that are above this current rmap:
      * because there were no VM_MERGEABLE vmas with such addresses.
-     * 在这个进程中的所有vma中没有找到可以合并的页面，释放这个rmap_list上的所有rmap_item
+     * 到这里，在这个进程中的所有vma中没有找到可以合并的页面，    
+     * 释放这个rmap_list上的所有rmap_item
      */
     remove_trailing_rmap_items(ksm_scan.rmap_list);
 
@@ -219,6 +219,43 @@ no_vmas:
     ksm_scan.seqnr++;
     return NULL;
 }
+
+/* 对于没有进程
+ * KSM会为每个待合并的page分配一个ksm_rmap_item，挂struct ksm_mm_slot->rmap_list上
+ * 顺序按虚拟地址从小到大排列，每完成一个页面的扫描之后，ksm_scan.address + PAGE_SIZE，
+ * ksm_scan.rmap_list向后移动一个，指向下次要扫描的rmap_item。
+ */
+static struct ksm_rmap_item *get_next_rmap_item(struct ksm_mm_slot *mm_slot,
+                        struct ksm_rmap_item **rmap_list,
+                        unsigned long addr)
+{
+    struct ksm_rmap_item *rmap_item;
+
+    while (*rmap_list) {
+        rmap_item = *rmap_list;
+        if ((rmap_item->address & PAGE_MASK) == addr)
+            return rmap_item;
+        if (rmap_item->address > addr)//之前没有为这个地址建立rmap_item，现在
+            break;
+        *rmap_list = rmap_item->rmap_list;
+/*到这里rmap_item->address < addr,说明之前为这个地址（rmap_item->address）
+的页面建立过rmap_item，现在由于某种原因无法合并了，否则一定会扫描
+*/
+        remove_rmap_item_from_tree(rmap_item);
+        free_rmap_item(rmap_item);
+    }
+
+    rmap_item = alloc_rmap_item();
+    if (rmap_item) {
+        /* It has already been zeroed */
+        rmap_item->mm = mm_slot->slot.mm;
+        rmap_item->mm->ksm_rmap_items++;
+        rmap_item->address = addr;
+        rmap_item->rmap_list = *rmap_list;
+        *rmap_list = rmap_item;
+    }
+    return rmap_item;
+}
 ```
 
 ```c
@@ -263,8 +300,8 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
     }
 
     /* We first start with searching the page inside the stable tree */
-    kpage = stable_tree_search(page);
-    if (kpage == page && rmap_item->head == stable_node) {//如果这个页面已经在stable数中
+    kpage = stable_tree_search(page);//在稳定树中找一个与page内容相同的页面
+    if (kpage == page && rmap_item->head == stable_node) {//如果找到的kpage和page是同一个页面
         put_page(kpage);//scan_get_next_rmap_item->follow_page中增加了_refcount计数
         return;
     }
