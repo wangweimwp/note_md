@@ -26,7 +26,23 @@ ksm_madvise
         ->wake_up_interruptible(&ksm_thread_wait);//唤醒ksm_do_scan进程
 
 
+ksm_do_scan
+    ->scan_get_next_rmap_item//扫描ksm_mm_head上的每个进程的每个页面，找到一个可被合并的候选页
+    ->cmp_and_merge_page
+        ->stable_tree_search
+        ->kpage = stable_tree_search(page)
+        ->if (kpage) {try_to_merge_with_ksm_page;stable_tree_append}//在稳定树中找一个与page内容相同的页面，合并
+        ->tree_rmap_item = unstable_tree_search_insert
+        ->if (tree_rmap_item) {try_to_merge_two_pages}//在不稳定树中找到内容一样的页面，尝试合并并放到稳定树中
 
+
+
+
+try_to_merge_with_ksm_page
+    ->try_to_merge_one_page
+        ->write_protect_page//对PTE进行写保护
+        ->//在于不稳定树节点合并时，set_page_stable_node(page, NULL);为插入稳定树做准备
+        ->//与稳定树的页面合并，replace_page，修改pte，指向kapge
 
 
 /**
@@ -343,6 +359,7 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
     /*
      * Same checksum as an empty page. We attempt to merge it with the
      * appropriate zero page if the user enabled this via sysfs.
+     * 处理零页情况
      */
     if (ksm_use_zero_pages && (checksum == zero_checksum)) {
         struct vm_area_struct *vma;
@@ -430,5 +447,43 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
     }
 }
 ```
+
+```c
+/*
+ * try_to_merge_two_pages - take two identical pages and prepare them
+ * to be merged into one page.
+ *
+ * This function returns the kpage if we successfully merged two identical
+ * pages into one ksm page, NULL otherwise.
+ *
+ * Note that this function upgrades page to ksm page: if one of the pages
+ * is already a ksm page, try_to_merge_with_ksm_page should be used.
+ */
+static struct page *try_to_merge_two_pages(struct ksm_rmap_item *rmap_item,
+					   struct page *page,
+					   struct ksm_rmap_item *tree_rmap_item,
+					   struct page *tree_page)
+{
+	int err;
+    //第一次调用主要将page设置为写保护，并设置为KSM页面
+	err = try_to_merge_with_ksm_page(rmap_item, page, NULL);
+	if (!err) {
+        //第二次调用将尝试合并两个页面，对比内容是否一致，并替换PTE
+		err = try_to_merge_with_ksm_page(tree_rmap_item,
+							tree_page, page);
+		/*
+		 * If that fails, we have a ksm page with only one pte
+		 * pointing to it: so break it.
+		 */
+		if (err)
+			break_cow(rmap_item);//合并失败，通过人为触发写错误缺页中断
+	}
+	return err ? NULL : page;
+}
+```
+
+
+
+
 
 ![](./image/2.JPG)
