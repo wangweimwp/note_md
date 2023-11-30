@@ -384,6 +384,7 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
         if (!err)
             return;
     }
+//在unstable中查找是否有内容相同的页面，若没有，把候选页面也加入到unstble树中
     tree_rmap_item =
         unstable_tree_search_insert(rmap_item, page, &tree_page);
     if (tree_rmap_item) {
@@ -460,30 +461,26 @@ static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_ite
  * is already a ksm page, try_to_merge_with_ksm_page should be used.
  */
 static struct page *try_to_merge_two_pages(struct ksm_rmap_item *rmap_item,
-					   struct page *page,
-					   struct ksm_rmap_item *tree_rmap_item,
-					   struct page *tree_page)
+                       struct page *page,
+                       struct ksm_rmap_item *tree_rmap_item,
+                       struct page *tree_page)
 {
-	int err;
+    int err;
     //第一次调用主要将page设置为写保护，并设置为KSM页面
-	err = try_to_merge_with_ksm_page(rmap_item, page, NULL);
-	if (!err) {
+    err = try_to_merge_with_ksm_page(rmap_item, page, NULL);
+    if (!err) {
         //第二次调用将尝试合并两个页面，对比内容是否一致，并替换PTE
-		err = try_to_merge_with_ksm_page(tree_rmap_item,
-							tree_page, page);
-		/*
-		 * If that fails, we have a ksm page with only one pte
-		 * pointing to it: so break it.
-		 */
-		if (err)
-			break_cow(rmap_item);//合并失败，通过人为触发写错误缺页中断
-	}
-	return err ? NULL : page;
+        err = try_to_merge_with_ksm_page(tree_rmap_item,
+                            tree_page, page);
+        /*
+         * If that fails, we have a ksm page with only one pte
+         * pointing to it: so break it.
+         */
+        if (err)
+            break_cow(rmap_item);//合并失败，通过人为触发写错误缺页中断
+    }
+    return err ? NULL : page;
 }
 ```
-
-
-
-
 
 ![](./image/2.JPG)
