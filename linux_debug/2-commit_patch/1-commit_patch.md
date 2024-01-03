@@ -2,7 +2,6 @@
 
 ```bash
 git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
-
 ```
 
 主分支代码是相对稳定的代码，一般不够新，本文选择最新尚在开发中的 `linux-next` 分支来演示内核补丁的提交，所以还要更新代码到最新分支：
@@ -29,8 +28,6 @@ $ git branch -a
   remotes/linux-next/stable
   remotes/origin/HEAD -> origin/master
   remotes/origin/master
-
-
 ```
 
 所有名字前面有 `remotes` 是都是远程分支引用，我们看到已经有一个 `master` 本地分支，这是在 `git clone` 时自动创建的。但这个本地分支不是我们要的，我们要建立一个关联到 `linux-next` 的本地分支：
@@ -53,7 +50,6 @@ $ git branch -a
   remotes/linux-next/stable
   remotes/origin/HEAD -> origin/master
   remotes/origin/master
-
 ```
 
 ### 提交补丁
@@ -129,3 +125,31 @@ linux-kernel@vger.kernel.org (open list)
 #给自己发送测试
 git send-email --smtp-debug --to=a929233872@163.com,929244872@qq.com --cc=929244872@qq.com 0001-mm-fix-some-error.patch
 ```
+
+# 内核修改点
+
+1，修改注释错误，文档档错误，不完善的地方
+
+2，移动函数位置，
+
+```textile
+将函数移动到唯一使用的文件中
+The mark_free_page() is only used in kernel/power/snapshot.c, move it out
+to reduce a bit of page_alloc.c
+```
+
+3，内核config拎出单独一个文件
+
+4，去掉重复函数
+
+5，若有功能相同的函数则使用函数，而不是代码
+
+```textile
+
+```
+
+# 目前发现可修改地方
+
+1，mm: page_alloc: move pm_* function into power，其中pm_suspended_storage是否可以去掉
+
+2，
