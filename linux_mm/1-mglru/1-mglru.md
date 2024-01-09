@@ -176,8 +176,6 @@ lru_gen_shrink_lruvec
 
 （4）shrink_folio_list对剥离到临时list的folio进行再次扫描，（后续分析shrink_folio_list）
 
-
-
 <img title="" src="./image/1.PNG" alt="" data-align="inline">
 
 <font color="#dd0000">**问题1：普通回收与强制回收**</font>
@@ -330,3 +328,41 @@ lru_gen_shrink_lruvec
 ![](./image/2.PNG)
 
 ![](./image/3.PNG)
+
+
+
+**问题11：mapped page如何一次升级到max_gen**
+
+（1）通过mmap的映射的内存不会马上分配。而是在第一次访问时通过page fault进入内存
+
+（2）对于mmap的文件页面，通过缺页中断进入内存的页面，直接进入max_gen
+
+```c
+handle_pte_fault
+	->do_fault
+		->do_read_fault                    
+			->do_fault
+				->vma->vm_ops->fault	//调用文件系统的fault方法
+					->filemap_fault
+						->__filemap_get_folio(mapping, index, FGP_CREAT|FGP_FOR_MMAP, vmf->gfp_mask);
+							->if (fgp_flags & FGP_ACCESSED)		/*__filemap_get_folio调用时没有设置 FGP_ACCESSED*/
+								__folio_set_referenced(folio);
+							->filemap_add_folio
+								->__filemap_add_folio
+								->folio_add_lru
+								->if (lru_gen_enabled() && !folio_test_unevictable(folio) &&
+									lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
+									folio_set_active(folio);	/* see the comment in lru_gen_add_folio() */
+									->lru_gen_add_folio
+									->if (folio_test_active(folio))
+										seq = lrugen->max_seq;
+```
+
+（3）对于通过系统调用进入到内存的文件页面，会设置__folio_set_referenced，最终在内存回收时，（后续分析系统调用进入内存页面代码路径？？？）
+
+```c
+shrink_folio_list
+	->if (lru_gen_enabled() && !ignore_references &&	
+		    folio_mapped(folio) && folio_test_referenced(folio))/*folio_update_gen() tried to promote this page? */
+			goto keep_locked;	/* 保持在原列表中，根据tier值决定是否升代*/
+```
