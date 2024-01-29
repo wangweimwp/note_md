@@ -21,8 +21,6 @@ invalidate_mapping_pages
     ->folio_batch_release     //释放页面，复合页和大页分开释放
 ```
 
-
-
 调用read读文件时
 
 ```c
@@ -34,17 +32,22 @@ ksys_read
 				->filemap_read
 					->filemap_get_pages
 						->filemap_get_read_batch
+						->page_cache_sync_readahead
+							->page_cache_sync_ra		//同步读取page cache
+								->ondemand_readahead
+									->do_page_cache_ra	//与page_cache_ra_order一样，最终调到aops->readahead，最终发送一些列bio
+									->page_cache_ra_order
 						->filemap_create_folio
 							->filemap_alloc_folio
 								->folio_alloc
 							->filemap_add_folio
-								->folio_ref_add    //增加 _ref_count计数
+								->folio_ref_add
 								->folio_add_lru
 							->filemap_read_folio
 							->folio_batch_add
 						->filemap_readahead
+							->page_cache_async_ra		//异步读取page cache
+								->ondemand_readahead	//最终调到aops->readahead，最终发送一些列bio
 						->filemap_update_page
 		->inc_syscr
 ```
-
-
