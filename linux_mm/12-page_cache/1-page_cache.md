@@ -24,14 +24,13 @@ invalidate_mapping_pages
 调用read读文件时
 
 ```c
-read文件
 ksys_read
 	->vfs_read
 		->new_sync_read
 			->file->f_op->read_iter(ext4_file_read_iter)
 				->filemap_read
 					->filemap_get_pages
-						->filemap_get_read_batch
+						->filemap_get_read_batch	//在address_space中逐页查找数据对应的page，若查找不到调用page_cache_sync_ra同步预读
 						->page_cache_sync_readahead
 							->page_cache_sync_ra		//同步读取page cache
 								->ondemand_readahead
@@ -45,9 +44,14 @@ ksys_read
 								->folio_add_lru
 							->filemap_read_folio
 							->folio_batch_add
-						->filemap_readahead
+						->filemap_readahead		//若查找到的page是PG_readahead调用page_cache_async_readahead()进行异步预读
 							->page_cache_async_ra		//异步读取page cache
 								->ondemand_readahead	//最终调到aops->readahead，最终发送一些列bio
-						->filemap_update_page
+						->filemap_update_page	
+								->filemap_read_folio	//最终调到aops->read_folio，最终发送一些列bio
 		->inc_syscr
+
+
 ```
+
+

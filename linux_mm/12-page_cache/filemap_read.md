@@ -146,12 +146,14 @@ retry:
 		if (iocb->ki_flags & IOCB_NOIO)
 			return -EAGAIN;
 		page_cache_sync_readahead(mapping, ra, filp, index,
-				last_index - index);
+				last_index - index);//文件数据没有在page cache中，进行同步预读
 		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 	}
 	if (!folio_batch_count(fbatch)) {
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
 			return -EAGAIN;
+        /*page_cache_sync_readahead不会进入内存分配慢速，有可能分配不到内存
+        这里再次申请内存，并最终调到aops->read_folio读取页面*/
 		err = filemap_create_folio(filp, mapping,
 				iocb->ki_pos >> PAGE_SHIFT, fbatch);
 		if (err == AOP_TRUNCATED_PAGE)
@@ -161,6 +163,8 @@ retry:
 
 	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
 	if (folio_test_readahead(folio)) {
+        /*触发一次异步预读,因为同步读成功命中，重新取预读更多的页面，也会
+          更新ra数据结构*/
 		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
 		if (err)
 			goto err;
@@ -169,6 +173,8 @@ retry:
 		if ((iocb->ki_flags & IOCB_WAITQ) &&
 		    folio_batch_count(fbatch) > 1)
 			iocb->ki_flags |= IOCB_NOWAIT;
+        /*由于IO阻塞，异步预读还没有进行，数据还没有更新，这会等待一段时间，
+        之后若还数据任然没有更新，则最终调到aops->read_folio现场读取*/
 		err = filemap_update_page(iocb, mapping, count, folio,
 					  need_uptodate);
 		if (err)
@@ -188,5 +194,140 @@ err:
 ```
 
 
+
+```c
+/*
+ * A minimal readahead algorithm for trivial sequential/random reads.
+ */
+static void ondemand_readahead(struct readahead_control *ractl,
+		struct folio *folio, unsigned long req_size)
+{
+	struct backing_dev_info *bdi = inode_to_bdi(ractl->mapping->host);
+	struct file_ra_state *ra = ractl->ra;
+	unsigned long max_pages = ra->ra_pages;
+	unsigned long add_pages;
+	pgoff_t index = readahead_index(ractl);
+	pgoff_t expected, prev_index;
+	unsigned int order = folio ? folio_order(folio) : 0;
+
+	/*
+	 * If the request exceeds the readahead window, allow the read to
+	 * be up to the optimal hardware IO size
+	 */
+     /*
+     * 确定预读的最大page数，默认设置为read_ahead_kb相应page，若请求数据大于read_ahead_kb，        
+     * 尽量使一次预读不超过硬件最大IO大小(通常在/sys/block/ * /queue/max_sectors_kb设置)。
+     */
+	if (req_size > max_pages && bdi->io_pages > max_pages)
+		max_pages = min(req_size, bdi->io_pages);
+
+	/*
+	 * start of file
+	 */
+	if (!index) //读一个文件第一页时，初始化fd的file_ra_state结构
+		goto initial_readahead;
+
+	/*
+	 * It's the expected callback index, assume sequential access.
+	 * Ramp up sizes, and push forward the readahead window.
+	 */
+    //读取预读window末尾的下一个page，判定为顺序读
+	expected = round_up(ra->start + ra->size - ra->async_size,
+			1UL << order);
+	if (index == expected || index == (ra->start + ra->size)) {
+		ra->start += ra->size;
+		ra->size = get_next_ra_size(ra, max_pages);
+		ra->async_size = ra->size;
+		goto readit;
+	}
+
+	/*
+	 * Hit a marked folio without valid readahead state.
+	 * E.g. interleaved reads.
+	 * Query the pagecache for async_size, which normally equals to
+	 * readahead size. Ramp it up and use it as the new readahead size.
+	 */
+	if (folio) {//读取到PG_readahead的page时启动异步预读
+		pgoff_t start;
+
+		rcu_read_lock();
+        //从offset开始，找下一个未在cache中的page作为下一次预读window的起始page
+		start = page_cache_next_miss(ractl->mapping, index + 1,
+				max_pages);
+		rcu_read_unlock();
+
+		if (!start || start - index > max_pages)
+			return;
+
+		ra->start = start;
+		ra->size = start - index;	/* old async_size */
+		ra->size += req_size;
+		ra->size = get_next_ra_size(ra, max_pages);//逐步增大预读page数
+		ra->async_size = ra->size;
+		goto readit;
+	}
+
+	/*
+	 * oversize read
+	 */
+    //一次性读取大量page，直接开始新一轮预读
+	if (req_size > max_pages)
+		goto initial_readahead;
+
+	/*
+	 * sequential cache miss
+	 * trivial case: (index - prev_index) == 1
+	 * unaligned reads: (index - prev_index) == 0
+	 */
+    //探测到有新的顺序读，开始新一轮预读
+	prev_index = (unsigned long long)ra->prev_pos >> PAGE_SHIFT;
+	if (index - prev_index <= 1UL)
+		goto initial_readahead;
+
+	/*
+	 * Query the page cache and look for the traces(cached history pages)
+	 * that a sequential stream would leave behind.
+	 */
+    //根据offset之前的page在cache里的情况判断是否是顺序读
+	if (try_context_readahead(ractl->mapping, ra, index, req_size,
+			max_pages))
+		goto readit;
+
+	/*
+	 * standalone, small random read
+	 * Read as is, and do not pollute the readahead state.
+	 */
+    //判断为随机读，仅读取请求大小的page，不改变file_ra_state和PG_readahead状态
+	do_page_cache_ra(ractl, req_size, 0);
+	return;
+
+initial_readahead://初始化file_ra_state，根据请求大小设置预读大小及PG_readahead的位置
+	ra->start = index;
+	ra->size = get_init_ra_size(req_size, max_pages);
+	ra->async_size = ra->size > req_size ? ra->size - req_size : ra->size;
+
+readit:
+	/*
+	 * Will this read hit the readahead marker made by itself?
+	 * If so, trigger the readahead marker hit now, and merge
+	 * the resulted next readahead window into the current one.
+	 * Take care of maximum IO pages as above.
+	 */
+	if (index == ra->start && ra->size == ra->async_size) {
+		add_pages = get_next_ra_size(ra, max_pages);
+		if (ra->size + add_pages <= max_pages) {
+			ra->async_size = add_pages;
+			ra->size += add_pages;
+		} else {
+			ra->size = max_pages;
+			ra->async_size = max_pages >> 1;
+		}
+	}
+
+	ractl->_index = ra->start;
+     //根据file_ra_state调用__do_page_cache_readahead()读取相应page，设置(start+size-async_size)的page为PG_readahead
+	page_cache_ra_order(ractl, ra, order);
+}
+```
 
 
