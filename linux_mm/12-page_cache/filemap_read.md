@@ -61,7 +61,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		 */
 		isize = i_size_read(inode);
 		if (unlikely(iocb->ki_pos >= isize))
-			goto put_folios;
+			goto put_folios;/* 读到文件末尾，退出 */
 		end_offset = min_t(loff_t, isize, iocb->ki_pos + iter->count);
 
 		/*
@@ -97,12 +97,12 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 			 */
 			if (writably_mapped)
 				flush_dcache_folio(folio);
-
+            /*filemap_get_pages读到的page是PageUptodate的，拷贝到用户空间*/
 			copied = copy_folio_to_iter(folio, offset, bytes, iter);
 
 			already_read += copied;
 			iocb->ki_pos += copied;
-			ra->prev_pos = iocb->ki_pos;
+			ra->prev_pos = iocb->ki_pos;/* 更新index，指向下一个page */
 
 			if (copied < bytes) {
 				error = -EFAULT;
@@ -113,7 +113,7 @@ put_folios:
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
 			folio_put(fbatch.folios[i]);
 		folio_batch_init(&fbatch);
-	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
+	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);/* read需要的数据已经全部拷贝完了，read流程结束返回 */
 
 	file_accessed(filp);
 
@@ -127,7 +127,9 @@ put_folios:
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
-	struct file *filp = iocb->ki_filp;
+	/* 根据read系统调用及上一次的readahead信息，计算read的起始index页，
+       结束last_index页,最后一个页面内的偏移量offset。 */
+    struct file *filp = iocb->ki_filp;
 	struct address_space *mapping = filp->f_mapping;
 	struct file_ra_state *ra = &filp->f_ra;
 	pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;
@@ -140,11 +142,26 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
 retry:
 	if (fatal_signal_pending(current))
 		return -EINTR;
-
-	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);//从adress_space的xarray中，通过index找到一系列folio
+    /* 循环处理[index, last_index] page，先在page cache中查找,如果能找到并且
+       是PageUptodate状态，则将page数据拷贝到用户态buf。如果找不到，触发同步预读 
+       page_cache_sync_readahead从存储器件读入一批page(大于
+       last_index - index个页面)。并将read需要的最后一个页面（last_index
+       对应的页面）的下一个页面设置PageReadahead。访问到这个标记的页面时触发异步预读 
+       page_cache_async_readahead从存储器件中再读入一批page，并把第一个page设置
+       成PageReadahead。*/
+	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);//从adress_space的xarray中，通过index找到一系列folio，这个page是read需要用的
 	if (!folio_batch_count(fbatch)) {//在adress_space中查找没有找到
 		if (iocb->ki_flags & IOCB_NOIO)
 			return -EAGAIN;
+       /* page cache中没有找到index的page，只能从存储器件中读取数据了。既然需要
+          通过disk io读取数据,就多预读一些page。参数index表示从哪个page开始读取，
+          req_size = last_index - index个page表示read需要读多少个page。
+          page_cache_sync_readahead一般会读取超过req_size个page，前req_size
+          个page是本次read请求的，多读的page本次用不到，提前读出来给后继访问使用。
+          多读的page中第一个page设置PageReadahead标记。
+          page_cache_sync_readahead申请page内存，并加入到page cache
+          中,然后通过submit_bio提交bio请求就返回了，至于器件有没有处理完这个io请求，
+          page_cache_sync_readahead不关心，不会等待页面变成PageUptodate。*/
 		page_cache_sync_readahead(mapping, ra, filp, index,
 				last_index - index);//文件数据没有在page cache中，进行同步预读
 		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
@@ -152,8 +169,10 @@ retry:
 	if (!folio_batch_count(fbatch)) {
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
 			return -EAGAIN;
+        /* 经过上面的预读,在page cache中大概率能找到index的page。
+           如果内存不足申请不到page，page cache中不会有index的page */
         /*page_cache_sync_readahead不会进入内存分配慢速，有可能分配不到内存
-        这里再次申请内存，并最终调到aops->read_folio读取页面*/
+        这里再次申请内存，并最终调到aops->read_folio读取单页数据*/
 		err = filemap_create_folio(filp, mapping,
 				iocb->ki_pos >> PAGE_SHIFT, fbatch);
 		if (err == AOP_TRUNCATED_PAGE)
@@ -161,7 +180,9 @@ retry:
 		return err;
 	}
 
-	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
+	folio = fbatch->folios[folio_batch_count(fbatch) - 1] //多读的folio中第一个folio设置PageReadahead标记                           
+    /* 如果这个page设置了PageReadahead标记，意味着预读窗口中未访问的page不多了，
+       需要启动异步预读再读入一批page备用。 */;
 	if (folio_test_readahead(folio)) {
         /*触发一次异步预读,因为同步读成功命中，重新取预读更多的页面，也会
           更新ra数据结构*/
@@ -173,8 +194,11 @@ retry:
 		if ((iocb->ki_flags & IOCB_WAITQ) &&
 		    folio_batch_count(fbatch) > 1)
 			iocb->ki_flags |= IOCB_NOWAIT;
+        /* 如果从page cache中找到的page不是PageUptodate状态，说明器件还没有处理完成，
+           则通过wait_on_page_locked_killable等待io处理完成.器件处理完io请求后，用
+           最新数据填充page,并释放page lock。*/
         /*由于IO阻塞，异步预读还没有进行，数据还没有更新，这会等待一段时间，
-        之后若还数据任然没有更新，则最终调到aops->read_folio现场读取*/
+        之后若还数据任然没有更新，则最终调到aops->read_folio现场读取单页数据*/
 		err = filemap_update_page(iocb, mapping, count, folio,
 					  need_uptodate);
 		if (err)
@@ -192,6 +216,77 @@ err:
 	return err;
 }
 ```
+
+
+
+```c
+static int filemap_update_page(struct kiocb *iocb,
+		struct address_space *mapping, size_t count,
+		struct folio *folio, bool need_uptodate)
+{
+	int error;
+
+	if (iocb->ki_flags & IOCB_NOWAIT) {
+		if (!filemap_invalidate_trylock_shared(mapping))
+			return -EAGAIN;
+	} else {
+		filemap_invalidate_lock_shared(mapping);
+	}
+
+	if (!folio_trylock(folio)) {
+		error = -EAGAIN;
+		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_NOIO))
+			goto unlock_mapping;
+		if (!(iocb->ki_flags & IOCB_WAITQ)) {
+			filemap_invalidate_unlock_shared(mapping);
+			/*
+			 * This is where we usually end up waiting for a
+			 * previously submitted readahead to finish.
+			 */ 
+            /* 器件处理完io，用最新数据填充page，然后unlock page */
+			folio_put_wait_locked(folio, TASK_KILLABLE);
+			return AOP_TRUNCATED_PAGE;
+		}
+		error = __folio_lock_async(folio, iocb->ki_waitq);
+		if (error)
+			goto unlock_mapping;
+	}
+
+	error = AOP_TRUNCATED_PAGE;
+	if (!folio->mapping)
+		goto unlock;
+
+	error = 0;
+/* 大概率是Uptodate状态.除非存在竞争场景，其他执行流先拿到了page lock，
+   并做了修改page状态 */ 
+/* page的部分数据是uptodate状态。page大小与存储器件block大小不一样时会出现这种情况，
+   一个page可能包含多个block，page中某些block数据是uptodate */
+ 	if (filemap_range_uptodate(mapping, iocb->ki_pos, count, folio,
+				   need_uptodate))
+		goto unlock;//page是Uptodate状态，或部分数据是uptodate状态
+
+	error = -EAGAIN;
+	if (iocb->ki_flags & (IOCB_NOIO | IOCB_NOWAIT | IOCB_WAITQ))
+		goto unlock;
+    /* 正常情况下，通过同步预读或异步预读加入到page cache的page，最终都
+       应该是PageUptodate状态。但存在一种可能，page虽然加入了page cache，
+       但同步或异步预读发生了io err导致了page中无有效有效数据。这个时候就要
+       通过apping->a_ops->readpage重新读取单个page数据 
+        或者mapping->a_ops->is_partially_uptodate部分PageUptodate判断失败*/
+	error = filemap_read_folio(iocb->ki_filp, mapping->a_ops->read_folio,
+			folio);
+	goto unlock_mapping;
+unlock:
+	folio_unlock(folio);
+unlock_mapping:
+	filemap_invalidate_unlock_shared(mapping);
+	if (error == AOP_TRUNCATED_PAGE)
+		folio_put(folio);
+	return error;
+}
+```
+
+
 
 
 
