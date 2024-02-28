@@ -19,11 +19,9 @@ invalidate_mapping_pages
         ->mapping_evict_folio    //判读页面有没有被mapped，若有被mapped则返回
             ->remove_mapping    //到这里说明页面没有mapped，直接释放即可，不需要try_to_unmap
     ->folio_batch_release     //释放页面，复合页和大页分开释放
-
+//echo 1 > drop_cache会遍历文件系统struct adress_space里的page，将没有被mapped页
 //read进来的page cache没有映射到用户空间，__map_count为0，所以drop_cache会清除page cache
 ```
-
-
 
 调用read读文件时
 

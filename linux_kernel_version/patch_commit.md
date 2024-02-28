@@ -33,7 +33,7 @@ TLBs after returning is broken:
 
 x = vb_alloc() // Removes vmap_block from free list because vb->free became 0
 vb_free(x)     // Unmaps page and marks in dirty_min/max range
-	       // Block has still mappings and is not put on purge list
+           // Block has still mappings and is not put on purge list
 
 // Page is reused
 vm_unmap_aliases() // Can't find vmap block with the dirty space -> FAIL
@@ -53,6 +53,10 @@ isolated to save some CPU cycles.
 内存规整时可以减少CPU消耗
 ```
 
+- vmstat: allow_direct_reclaim should use zone_page_state_snapshot
 
+```context
+修复在用nohz_full（cmdline参数）指定的CPU上，空闲页面技术不准确的
+```
 
 
