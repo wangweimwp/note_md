@@ -59,4 +59,20 @@ isolated to save some CPU cycles.
 修复在用nohz_full（cmdline参数）指定的CPU上，空闲页面技术不准确的
 ```
 
+- Patch series "mm/ksm: Add ksm advisor", v5.
 
+```text
+KSM advisor特性允许自动调整KSM系统
+```
+
+- Merge tag 'slab-for-6.8' of git://git.kernel.org/pub/scm/linux/kernel/git/vbabka/slab
+
+```context
+内核删除slab机制，只留slub
+```
+
+- [RFC PATCH V3 0/6] SCHED_DEADLINE server infrastructure
+
+```text
+
+```
