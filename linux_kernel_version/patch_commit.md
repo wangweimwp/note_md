@@ -71,8 +71,26 @@ KSM advisor特性允许自动调整KSM系统
 内核删除slab机制，只留slub
 ```
 
-- [RFC PATCH V3 0/6] SCHED_DEADLINE server infrastructure
+- sched/deadline: Introduce deadline servers
 
 ```text
+加入deadline servers机制，防止实时进程占用所有CPU时间而普通进程饿死
+```
+
+- mm: skip CMA pages when they are not available
+
+```context
+在内存回收时调过CMA页面。
+This patch fixes unproductive reclaiming of CMA pages by skipping them
+when they are not available for current context.  It arises from the below
+OOM issue, which was caused by a large proportion of MIGRATE_CMA pages
+among free pages.
+
+遍历不可用的CMA页面会增加nr_scan，系统误任务可回收的页面很少，报OOM，
+但是有些可以被回收的页面没有被遍历到，这种现象在CMA页面越多的系统中越容易
+
+
 
 ```
+
+
