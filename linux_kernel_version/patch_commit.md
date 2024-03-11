@@ -88,9 +88,30 @@ among free pages.
 
 遍历不可用的CMA页面会增加nr_scan，系统误任务可回收的页面很少，报OOM，
 但是有些可以被回收的页面没有被遍历到，这种现象在CMA页面越多的系统中越容易
+```
+
+mm/filemap.c: fix update prev_pos after one read request done
+
+```context
+修复文件预读性能下降，这个性能下降是有V6.4版本合入的一个补丁引入的
+```
 
 
 
+# 快起方面
+
+- mm: pass nid to reserve_bootmem_region()
+
+```context
+early_pfn_to_nid() is called frequently in init_reserved_page(), it
+returns the node id of the PFN.  These PFN are probably from the same
+memory region, they have the same node id.  It's not necessary to call
+early_pfn_to_nid() for each PFN
+before:
+memmap_init_reserved_pages()  67ms
+
+after:
+memmap_init_reserved_pages()  20ms
 ```
 
 
