@@ -40,4 +40,4 @@ CMA区域分为全局CMA区域和设备私有CMA区域。全局CMA区域是由�
 
 3，内核allocpage申请内存时，将从首选zone中分配页面，若MIGRATE_MOVABLE页面不足，则从MIGRATE_CMA中分配，
 
-4，如还分配做出来，进而寻找下个zone中的MIGRATE_MOVABLE和MIGRATE_CMA页面
+4，如还分配不出来，进而寻找下个zone中的MIGRATE_MOVABLE和MIGRATE_CMA页面
