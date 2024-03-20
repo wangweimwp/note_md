@@ -57,3 +57,148 @@ split_huge_pmd这个函数就是只切分一个进程里大页的映射,其他�
 ![](./image/7.PNG)
 
 ![](./image/8.PNG)
+
+**thp测试代码**
+
+```c
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
+#define LENGTH (256UL*1024*1024)
+#define PROTECTION (PROT_READ | PROT_WRITE)
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000 /* arch specific */
+#endif
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+
+#ifndef MAP_HUGE_MASK
+#define MAP_HUGE_MASK 0x3f
+#endif
+
+/* Only ia64 requires this */
+#ifdef __ia64__
+#define ADDR (void *)(0x8000000000000000UL)
+#define FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED)
+#else
+#define ADDR (void *)(0x0UL)
+#define FLAGS (MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB)
+#endif
+
+static void check_bytes(char *addr)
+{
+    printf("First hex is %x\n", *((unsigned int *)addr));
+}
+
+static void write_bytes(char *addr, size_t length)
+{
+    unsigned long i;
+
+    for (i = 0; i < length; i++)
+        *(addr + i) = (char)i;
+}
+
+static int read_bytes(char *addr, size_t length)
+{
+    unsigned long i;
+
+    check_bytes(addr);
+    for (i = 0; i < length; i++)
+        if (*(addr + i) != (char)i) {
+            printf("Mismatch at %lu\n", i);
+            return 1;
+        }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    void *addr;
+    int ret;
+    size_t length = LENGTH;
+    int flags = FLAGS;
+    int shift = 0;
+
+    if (argc > 1)
+        length = atol(argv[1]) << 20;
+    if (argc > 2) {
+        shift = atoi(argv[2]);
+        /*
+        if (shift)
+            flags |= (shift & MAP_HUGE_MASK) << MAP_HUGE_SHIFT;
+        */
+    }
+
+    if (shift)
+        printf("%u kB hugepages\n", 1 << (shift - 10));
+    else
+        printf("Default size hugepages\n");
+    printf("Mapping %lu Mbytes\n", (unsigned long)length >> 20);
+
+
+    addr = mmap(NULL, length, PROTECTION, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (addr == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+#if 0
+    addr = malloc(length);
+    if (!addr) {
+        perror("malloc");
+        exit(1);
+    }
+#endif
+    ret = madvise(addr, length, MADV_HUGEPAGE);
+    if(ret){
+        printf("ret = %d\n", ret);
+        perror("madvise");
+    }
+
+
+
+    /* munmap() length of MAP_HUGETLB memory must be hugepage aligned */
+    while(1){
+        printf("Returned address is %p\n", addr);
+        check_bytes(addr);
+        write_bytes(addr, length);
+        ret = read_bytes(addr, length);
+        sleep(10);
+    }
+
+    if (munmap(addr, length)) {
+        perror("munmap");
+        exit(1);
+    }
+
+    //free(addr);
+    return ret;
+}
+```
+
+
+
+
+
+**bpf测试程序**
+
+```c
+#! /usr/bin/bpftrace
+
+#include<linux/mm_types.h>
+#include<linux/sched.h>
+
+kprobe:hpage_collapse_scan_pmd
+{
+	$mm = (struct vm_area_struct *)arg2;
+	printf("pid = %d \n", $mm->vm_mm->owner->pid);
+
+}
+
+```
