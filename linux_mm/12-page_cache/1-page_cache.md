@@ -23,7 +23,56 @@ invalidate_mapping_pages
 //read进来的page cache没有映射到用户空间，__map_count为0，所以drop_cache会清除page cache
 ```
 
-调用read读文件时
+**drop_cache能drop掉hugetlbfs文件的pagecache吗？**
+
+本分分析基于linux内核4.19.195版本。
+我们知道，drop_cache有两个用途，第一个是清除掉page cache以释放出一些内存空间，第二个是调用shrinker的接口，这个接口会释放掉inode、dentry等文件系统相关的cache以及其他组件的一些东西。
+今天突然脑袋发热的问了自己一个问题：
+
+
+drop_cache能drop掉hugetlbfs文件的pagecache吗？
+
+按drop_cache的原理来说是没问题的，drop_cache会去遍历每个super_block下的所有inode，并扫描其address_space中与page_cache相关的结构体（可能是radix_tree或者xarray），然后清理出page_cache占用的内存。
+试了一下，发现根本drop不掉，why？
+这里先给出答案：
+
+
+
+drop不掉的本质原因是hugetlbfs是一个没有[backend](https://so.csdn.net/so/search?q=backend&spm=1001.2101.3001.7020)的文件系统，若这些cache被清除掉了，将无法恢复
+
+
+
+那么，内核代码中是在哪里把hugetlbfs的drop_cache流程给拦住的呢？
+答案是drop_caches_sysctl_handler()->drop_pagecache_sb()->invalidate_mapping_pages()->invalidate_inode_page()函数中，会判断相关page是否是能够write back的，
+
+```c
+/*
+ * Safely invalidate one page from its pagecache mapping.
+ * It only drops clean, unused pages. The page must be locked.
+ *
+ * Returns 1 if the page is successfully invalidated, otherwise 0.
+ */
+int invalidate_inode_page(struct page *page)
+{
+	struct address_space *mapping = page_mapping(page);
+	if (!mapping)
+		return 0;
+	if (PageDirty(page) || PageWriteback(page)) //hugetlbfs的文件会因为PageWriteback(page)的判断而导致不能drop cache
+		return 0;
+	if (page_mapped(page))
+		return 0;
+	return invalidate_complete_page(mapping, page);
+}
+
+```
+
+
+
+
+
+
+
+**调用read读文件时**
 
 ```c
 ksys_read
