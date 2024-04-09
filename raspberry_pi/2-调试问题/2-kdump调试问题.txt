@@ -1,0 +1,39 @@
+el0_svc
+
+推测， 此时 CPU无事可做处于idle进程，输入echo c > /proc/sysrq-trigger后触发el0_svc异常，进入panic函数，一直
+
+到关闭中断，发送spi数据，进入spi_sync->wait_for_completion-> schedule_time函数进行任务调度，整个过程该cpu就绪队列的curr（当前进程）成员一直是idle进程，所以会触发bad: scheduling from the idle thread!，
+
+![](./image/1.PNG)
+
+由于wait_for_completion中将进程状态设置为TASK_UNINTERRUPTIBLE，23行判断成立，24行判断不成立（返回0），则会将idle进程移除就绪队列操作，此时deactivate_task函数提示bad: scheduling from the idle thread!，但并没有将idle真正移除就绪队列，此时就会出现idle进程的状态为TASK_UNINTERRUPTIBLE，但其任然在就绪队列里，内次从idle进程调度出去之后都会打印警告
+
+正常状态下，idle进程始终处于TASK_RUNNING，则23行判断始终不会成立
+
+
+
+正常睡眠唤醒流程
+
+
+
+![](./image/2.PNG)
+
+1，condition不成立，进程P在第9行后进入睡眠，在等待队列里等待被唤醒
+
+2，condition成立，进程A唤醒进程P，进程P从第9行开始跑
+
+3，第一种情况，进程P代码流从第9行->第3行->第4行 .....到第6行，若在第6行后发生硬件中断，中断返回时发生抢占调度，
+
+4，
+
+![](./image/3.PNG)
+
+若没有23行判断，代码走23-31行分支，由于进程P被唤醒后还没来得及设置task_running，此时进程状态依然为task_interruptible，24行判断成立，进程P又会被移除就绪队列
+
+5，若condition只触发一次，此时再没有进程唤醒进程P（），进程P将永远不会被调度。
+
+6，第二种情况，若进程第一次被唤醒后，在第4行之后发生中断，中断返回前发生抢占调度，此时进程状态依然为task_interruptible，
+
+7，24行判断成立，进程P又会被移除就绪队列，即使再有进程唤醒进程P，由于还没有添加到等待队列中（第5行），进程P无法被唤醒，
+
+
