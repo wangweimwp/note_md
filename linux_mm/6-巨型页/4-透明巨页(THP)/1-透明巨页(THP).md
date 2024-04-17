@@ -93,102 +93,104 @@ split_huge_pmd这个函数就是只切分一个进程里大页的映射,其他�
 
 static void check_bytes(char *addr)
 {
-	printf("First hex is %x\n", *((unsigned int *)addr));
+    printf("First hex is %x\n", *((unsigned int *)addr));
 }
 
 static void write_bytes(char *addr, size_t length)
 {
-	unsigned long i;
+    unsigned long i;
 
-	for (i = 0; i < length; i++)
-		*(addr + i) = (char)i;
+    for (i = 0; i < length; i++)
+        *(addr + i) = (char)i;
 }
 
 static int read_bytes(char *addr, size_t length)
 {
-	unsigned long i;
+    unsigned long i;
 
-	check_bytes(addr);
-	for (i = 0; i < length; i++)
-		if (*(addr + i) != (char)i) {
-			printf("Mismatch at %lu\n", i);
-			return 1;
-		}
-	return 0;
+    check_bytes(addr);
+    for (i = 0; i < length; i++)
+        if (*(addr + i) != (char)i) {
+            printf("Mismatch at %lu\n", i);
+            return 1;
+        }
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-	void *addr;
-	int ret;
-	size_t length = LENGTH;
-	int flags = FLAGS;
-	int shift = 0;
-	int i;
+    void *addr;
+    int ret;
+    size_t length = LENGTH;
+    int flags = FLAGS;
+    int shift = 0;
+    int i;
 
-	if (argc > 1)
-		length = atol(argv[1]) << 20;
-	if (argc > 2) {
-		shift = atoi(argv[2]);
-		/*
-		if (shift)
-			flags |= (shift & MAP_HUGE_MASK) << MAP_HUGE_SHIFT;
-		*/
-	}
+    if (argc > 1)
+        length = atol(argv[1]) << 20;
+    if (argc > 2) {
+        shift = atoi(argv[2]);
+        /*
+        if (shift)
+            flags |= (shift & MAP_HUGE_MASK) << MAP_HUGE_SHIFT;
+        */
+    }
 
-	if (shift)
-		printf("%u kB hugepages\n", 1 << (shift - 10));
-	else
-		printf("Default size hugepages\n");
-	printf("Mapping %lu Mbytes\n", (unsigned long)length >> 20);
+    if (shift)
+        printf("%u kB hugepages\n", 1 << (shift - 10));
+    else
+        printf("Default size hugepages\n");
+    printf("Mapping %lu Mbytes\n", (unsigned long)length >> 20);
 
 
-	addr = mmap(NULL, length, PROTECTION, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-	if (addr == MAP_FAILED) {
-		perror("mmap");
-		exit(1);
-	}
-	for(i = 0; i < 10; i++){
-		printf("befor Returned address is %p\n", addr);
-		check_bytes(addr);
-		write_bytes(addr, length);
-		ret = read_bytes(addr, length);
-		sleep(10);
-		
-	}
+    addr = mmap(NULL, length, PROTECTION, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (addr == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+/*在设置MADV_HUGEPAGE标志前向内存中写数据，不然看不到khugepage线程合并过程
+若在设置MADV_HUGEPAGE标志后向内存中写数据，缺页中断将直接分配*/
+    for(i = 0; i < 10; i++){
+        printf("befor Returned address is %p\n", addr);
+        check_bytes(addr);
+        write_bytes(addr, length);
+        ret = read_bytes(addr, length);
+        sleep(10);
+
+    }
 #if 0
-	addr = malloc(length);
-	if (!addr) {
-		perror("malloc");
-		exit(1);
-	}
+    addr = malloc(length);
+    if (!addr) {
+        perror("malloc");
+        exit(1);
+    }
 #endif
-	ret = madvise(addr, length, MADV_HUGEPAGE);
-	if(ret){
-		printf("ret = %d\n", ret);
-		perror("madvise");
-	}
-	
+    ret = madvise(addr, length, MADV_HUGEPAGE);
+    if(ret){
+        printf("ret = %d\n", ret);
+        perror("madvise");
+    }
 
 
-	/* munmap() length of MAP_HUGETLB memory must be hugepage aligned */
-	while(1){
-		printf("Returned address is %p\n", addr);
-		check_bytes(addr);
-		write_bytes(addr, length);
-		ret = read_bytes(addr, length);
-		sleep(10);
-	}
 
-	if (munmap(addr, length)) {
-		perror("munmap");
-		exit(1);
-	}
-	
-	//free(addr);
-	return ret;
+    /* munmap() length of MAP_HUGETLB memory must be hugepage aligned */
+    while(1){
+        printf("Returned address is %p\n", addr);
+        check_bytes(addr);
+        write_bytes(addr, length);
+        ret = read_bytes(addr, length);
+        sleep(10);
+    }
+
+    if (munmap(addr, length)) {
+        perror("munmap");
+        exit(1);
+    }
+
+    //free(addr);
+    return ret;
 }
-
 ```
 
 **bpf测试程序**
