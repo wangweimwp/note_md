@@ -90,10 +90,25 @@ among free pages.
 但是有些可以被回收的页面没有被遍历到，这种现象在CMA页面越多的系统中越容易
 ```
 
-mm/filemap.c: fix update prev_pos after one read request done
+- mm/filemap.c: fix update prev_pos after one read request done
 
 ```context
 修复文件预读性能下降，这个性能下降是有V6.4版本合入的一个补丁引入的
+```
+
+- mm/vmscan: fix root proactive reclaim unthrottling unbalanced node
+
+```textile
+When memory.reclaim was introduced, it became the first case where
+cgroup_reclaim() is true for the root cgroup.  Johannes concluded [1] that
+for most cases this is okay, except for one case.  Historically, kswapd
+would throttle reclaim on a node if a lot of pages marked for reclaim are
+under writeback (aka the node is congested).  This occurred by setting
+LRUVEC_CONGESTED bit in lruvec->flags.  The bit would be cleared when the
+node is balanced.
+
+root cgroup和non-root memcgs共用LRUVEC_CONGESTED 比特位，用于标记当前内存节点
+有许多赃页在回写，当node达到平衡后清除，这回造成
 ```
 
 
@@ -113,5 +128,3 @@ memmap_init_reserved_pages()  67ms
 after:
 memmap_init_reserved_pages()  20ms
 ```
-
-
