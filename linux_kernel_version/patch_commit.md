@@ -65,6 +65,16 @@ isolated to save some CPU cycles.
 KSM advisor特性允许自动调整KSM系统
 ```
 
+- mm: add new api to enable ksm per process
+
+```textile
+KSM 继承 prctl()新增PR_SET_MEMORY_MERGE 标志可用于在进程的所有兼容 VMAs 
+中启用 KSM 这个设置在进程 fork 时也会继承，因此对于任何子进程来说，
+KSM 也将在兼容 VMA 上启用
+```
+
+
+
 - Merge tag 'slab-for-6.8' of git://git.kernel.org/pub/scm/linux/kernel/git/vbabka/slab
 
 ```context
@@ -110,8 +120,6 @@ node is balanced.
 root cgroup和non-root memcgs共用LRUVEC_CONGESTED 比特位，用于标记当前内存节点
 有许多赃页在回写，当node达到平衡后清除，这回造成
 ```
-
-
 
 # 快起方面
 
