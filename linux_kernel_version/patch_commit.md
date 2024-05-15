@@ -73,8 +73,6 @@ KSM 继承 prctl()新增PR_SET_MEMORY_MERGE 标志可用于在进程的所有兼
 KSM 也将在兼容 VMA 上启用
 ```
 
-
-
 - Merge tag 'slab-for-6.8' of git://git.kernel.org/pub/scm/linux/kernel/git/vbabka/slab
 
 ```context
@@ -120,6 +118,15 @@ node is balanced.
 root cgroup和non-root memcgs共用LRUVEC_CONGESTED 比特位，用于标记当前内存节点
 有许多赃页在回写，当node达到平衡后清除，这回造成
 ```
+
+- Multi-gen LRU: fix per-zone reclaim
+
+```textile
+MGLRU,回收时只会回收申请zone的最老一代，若申请zone的最老一代没有页面，
+但其他zone的最老一代有比较多的cold，这些page将得不到回收，修复这个问题
+```
+
+
 
 # 快起方面
 
