@@ -18,7 +18,7 @@ always inherit madvise [never]
 
 ```c
 do_anonymous_page
-    ->alloc_anon_folio  
+    ->alloc_anon_folio  //新增申请页面接口
         ->thp_vma_allowable_orders//根据VMA->vm_end，和系统允许的大页order，确定要申请的order
         ->thp_vma_suitable_orders
         ->//根据是否已经申请pte表项（pte_range_none），确定order
@@ -26,6 +26,158 @@ do_anonymous_page
 ```
 
 后续研究是否可以优化下order的计算，提个patch？？？
+
+```c
+/**
+ * folio_add_new_anon_rmap - Add mapping to a new anonymous folio.
+ * @folio:	The folio to add the mapping to.
+ * @vma:	the vm area in which the mapping is added
+ * @address:	the user virtual address mapped
+ *
+ * Like folio_add_anon_rmap_*() but must only be called on *new* folios.
+ * This means the inc-and-test can be bypassed.
+ * The folio does not have to be locked.
+ *
+ * If the folio is pmd-mappable, it is accounted as a THP.  As the folio
+ * is new, it's assumed to be mapped exclusively by a single process.
+ */
+void folio_add_new_anon_rmap(struct folio *folio, struct vm_area_struct *vma,
+		unsigned long address)
+{
+	int nr = folio_nr_pages(folio);
+
+	VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
+	VM_BUG_ON_VMA(address < vma->vm_start ||
+			address + (nr << PAGE_SHIFT) > vma->vm_end, vma);
+	__folio_set_swapbacked(folio);
+	__folio_set_anon(folio, vma, address, true);
+
+	if (likely(!folio_test_large(folio))) {//folio不是大页，folio是单个的页
+		/* increment count (starts at -1) */
+		atomic_set(&folio->_mapcount, 0);
+		SetPageAnonExclusive(&folio->page);
+	} else if (!folio_test_pmd_mappable(folio)) {//folio是大页，但不是PMD_ORDER的大页,代表folio是64KB、128KN这样的普通大页
+		int i;
+
+		for (i = 0; i < nr; i++) {
+			struct page *page = folio_page(folio, i);
+
+			/* increment count (starts at -1) */
+			atomic_set(&page->_mapcount, 0);
+			SetPageAnonExclusive(page);
+		}
+
+		atomic_set(&folio->_nr_pages_mapped, nr);
+	} else {//filio是folio_test_pmd_mappable的大页
+		/* increment count (starts at -1) */
+		atomic_set(&folio->_entire_mapcount, 0);
+		atomic_set(&folio->_nr_pages_mapped, ENTIRELY_MAPPED);
+		SetPageAnonExclusive(&folio->page);
+		__lruvec_stat_mod_folio(folio, NR_ANON_THPS, nr);
+	}
+
+	__lruvec_stat_mod_folio(folio, NR_ANON_MAPPED, nr);
+}
+```
+
+```c
+
+static bool pte_range_none(pte_t *pte, int nr_pages)
+{
+	int i;
+
+	for (i = 0; i < nr_pages; i++) {
+		if (!pte_none(ptep_get_lockless(pte + i)))
+			return false;
+	}
+
+	return true;
+}
+
+static struct folio *alloc_anon_folio(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	unsigned long orders;
+	struct folio *folio;
+	unsigned long addr;
+	pte_t *pte;
+	gfp_t gfp;
+	int order;
+
+	/*
+	 * If uffd is active for the vma we need per-page fault fidelity to
+	 * maintain the uffd semantics.
+	 */
+	if (unlikely(userfaultfd_armed(vma)))
+		goto fallback;
+
+	/*
+	 * Get a list of all the (large) orders below PMD_ORDER that are enabled
+	 * for this vma. Then filter out the orders that can't be allocated over
+	 * the faulting address and still be fully contained in the vma.
+	 */
+	orders = thp_vma_allowable_orders(vma, vma->vm_flags, false, true, true,
+					  BIT(PMD_ORDER) - 1);//检查vma允许的大页order，返回允许order位图
+	orders = thp_vma_suitable_orders(vma, vmf->address, orders);//计算本次申请合适的order
+
+	if (!orders)//没有合适的大页order，申请小页
+		goto fallback;
+
+	pte = pte_offset_map(vmf->pmd, vmf->address & PMD_MASK);
+	if (!pte)
+		return ERR_PTR(-EAGAIN);
+
+	/*
+	 * Find the highest order where the aligned range is completely
+	 * pte_none(). Note that all remaining orders will be completely
+	 * pte_none().
+	 */
+
+/*
+在所有允许的order中，找到一个最大的order，这连续2^order个PTE表项都为空，
+意味着后边可以为申请到的页面做映射
+*/
+	order = highest_order(orders);
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		if (pte_range_none(pte + pte_index(addr), 1 << order))
+			break;
+		order = next_order(&orders, order);
+	}
+
+	pte_unmap(pte);
+
+	/* Try allocating the highest of the remaining orders. */
+    /* 尽可能申请最大order的页面. */
+	gfp = vma_thp_gfp_mask(vma);
+	while (orders) {
+		addr = ALIGN_DOWN(vmf->address, PAGE_SIZE << order);
+		folio = vma_alloc_folio(gfp, order, vma, addr, true);
+		if (folio) {
+			if (mem_cgroup_charge(folio, vma->vm_mm, gfp)) {
+				folio_put(folio);
+				goto next;
+			}
+			folio_throttle_swaprate(folio, gfp);
+			clear_huge_page(&folio->page, vmf->address, 1 << order);//页面内容写0
+			return folio;
+		}
+next:
+		order = next_order(&orders, order);
+	}
+
+fallback:
+#endif
+	return folio_prealloc(vma->vm_mm, vma, vmf->address, true);
+}
+
+
+```
+
+
+
+
 
 **2、 Ryan Roberts（ARM）贡献的 Transparent Contiguous PTEs for Us er Mappings**
 
@@ -69,5 +221,3 @@ b，在 SWP_SYNCHRONOUS_IO 路径上针对同步设备的 swapin
 c，在 swapin_readahead() 路径上针对非同步设备或者 __swap_count(entry) != 1 的 swapin。
 
 目前 patchset 瞄准 a、b 针对手机和嵌入式等采用 zRAM 的场景进行，相信该 patchset 后续会进一步发展到针对路径 c 的支持。近期可能较早能合入的是路径 a 的部分 large folios swap-in: handle refault cases first
-
-
