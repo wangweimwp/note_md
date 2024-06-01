@@ -126,6 +126,13 @@ linux-kernel@vger.kernel.org (open list)
 git send-email --smtp-debug --to=a929233872@163.com,929244872@qq.com --cc=929244872@qq.com 0001-mm-fix-some-error.patch
 ```
 
+# 社区邮件术语
+
+```tex
+I ICU  如果我了解得没错(If I Understand Correctly
+I IRC  如果我没记错（If I Remember Correctly
+```
+
 # 内核修改点
 
 1，修改注释错误，文档档错误，不完善的地方
