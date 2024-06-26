@@ -67,8 +67,96 @@ shrink_folio_liststatic unsigned int shrink_folio_list(struct list_head *folio_l
 ```c
 add_to_swap
     ->folio_alloc_swap
+        ->get_swap_pages//申请swap slot，THP直接获取slot， 若per_cpu缓存用完则再申请填充
     ->add_to_swap_cache
     ->folio_mark_dirty(folio);
+```
+
+```c
+int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_size)
+{
+	unsigned long size = swap_entry_size(entry_size);
+	struct swap_info_struct *si, *next;
+	long avail_pgs;
+	int n_ret = 0;
+	int node;
+
+	/* Only single cluster request supported */
+	WARN_ON_ONCE(n_goal > 1 && size == SWAPFILE_CLUSTER);
+
+	spin_lock(&swap_avail_lock);
+
+	avail_pgs = atomic_long_read(&nr_swap_pages) / size;
+	if (avail_pgs <= 0) {
+		spin_unlock(&swap_avail_lock);
+		goto noswap;
+	}
+
+	n_goal = min3((long)n_goal, (long)SWAP_BATCH, avail_pgs);
+
+	atomic_long_sub(n_goal * size, &nr_swap_pages);
+
+start_over:
+	node = numa_node_id();
+	plist_for_each_entry_safe(si, next, &swap_avail_heads[node], avail_lists[node]) {
+		/* requeue si to after same-priority siblings */
+		plist_requeue(&si->avail_lists[node], &swap_avail_heads[node]);
+		spin_unlock(&swap_avail_lock);
+		spin_lock(&si->lock);
+		if (!si->highest_bit || !(si->flags & SWP_WRITEOK)) {
+        /*swap_info_struct 没有可用的slot，寻找下一个*/
+			spin_lock(&swap_avail_lock);
+			if (plist_node_empty(&si->avail_lists[node])) {
+				spin_unlock(&si->lock);
+				goto nextsi;
+			}
+			WARN(!si->highest_bit,
+			     "swap_info %d in list but !highest_bit\n",
+			     si->type);
+			WARN(!(si->flags & SWP_WRITEOK),
+			     "swap_info %d in list but !SWP_WRITEOK\n",
+			     si->type);
+			__del_from_avail_list(si);
+			spin_unlock(&si->lock);
+			goto nextsi;
+		}
+		if (size == SWAPFILE_CLUSTER) {//直接申请一个cluster
+			if (si->flags & SWP_BLKDEV)
+				n_ret = swap_alloc_cluster(si, swp_entries);
+		} else
+			n_ret = scan_swap_map_slots(si, SWAP_HAS_CACHE,
+						    n_goal, swp_entries);//根据swap_map位图获取slot
+		spin_unlock(&si->lock);
+		if (n_ret || size == SWAPFILE_CLUSTER)
+			goto check_out;
+		cond_resched();
+
+		spin_lock(&swap_avail_lock);
+nextsi:
+		/*
+		 * if we got here, it's likely that si was almost full before,
+		 * and since scan_swap_map_slots() can drop the si->lock,
+		 * multiple callers probably all tried to get a page from the
+		 * same si and it filled up before we could get one; or, the si
+		 * filled up between us dropping swap_avail_lock and taking
+		 * si->lock. Since we dropped the swap_avail_lock, the
+		 * swap_avail_head list may have been modified; so if next is
+		 * still in the swap_avail_head list then try it, otherwise
+		 * start over if we have not gotten any slots.
+		 */
+		if (plist_node_empty(&next->avail_lists[node]))
+			goto start_over;
+	}
+
+	spin_unlock(&swap_avail_lock);
+
+check_out:
+	if (n_ret < n_goal)
+		atomic_long_add((long)(n_goal - n_ret) * size,
+				&nr_swap_pages);
+noswap:
+	return n_ret;
+}
 ```
 
 
