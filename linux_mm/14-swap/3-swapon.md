@@ -5,7 +5,16 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
     ->claim_swapfile //独占方式打开bdev,设置blcoksize为PAGESIZE
     ->read_mapping_page//读取swap分区的第一个page
     ->//根据读取的第一个page，获取 union swap_header
-    ->read_swap_header
+    ->read_swap_header//根据 swap_header初始化struct swap_info_struct 一些成员
+                      //返回可以分配的总页数。取决于两点，swap_entry_t中swap offset的bit数
+    ->swap_map = vzalloc(maxpages); //分配swap_map数组内存
+    ->//初始化struct swap_info_struct的struct swap_cluster_info
+    ->swap_cgroup_swapon
+    ->setup_swap_map_and_extents//建立struct swap_extent, 该结构体用于将磁盘
+    //上的block和内存的page联系起来，许多个 struct swap_extent挂载红黑树上
+    ->init_swap_address_space    //* One swap address space for each 64M swap space */
+    ->enable_swap_info//建立swap_map、struct swap_cluster_info
+                        //的联系，设置以前全局变量
 ```
 
 ```c
