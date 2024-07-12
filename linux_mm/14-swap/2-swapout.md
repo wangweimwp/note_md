@@ -72,8 +72,23 @@ shrink_folio_liststatic unsigned int shrink_folio_list(struct list_head *folio_l
     pageout(folio, mapping, &plug)
     ......
     /*IO操作完后，回写完成，再次进入shrink_folio_list。将folio从swap cache中删除*/
-    __remove_mapping(mapping, folio, true,
-							 sc->target_mem_cgroup)
+   if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
+			/* follow __remove_mapping for reference */
+			if (!folio_ref_freeze(folio, 1))
+				goto keep_locked;
+			/*
+			 * The folio has only one reference left, which is
+			 * from the isolation. After the caller puts the
+			 * folio back on the lru and drops the reference, the
+			 * folio will be freed anyway. It doesn't matter
+			 * which lru it goes on. So we don't bother checking
+			 * the dirty flag here.
+			 */
+			count_vm_events(PGLAZYFREED, nr_pages);
+			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
+		} else if (!mapping || !__remove_mapping(mapping, folio, true,
+							 sc->target_mem_cgroup))
+			goto keep_locked;
 
 }
 ```
