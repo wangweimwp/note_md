@@ -85,6 +85,8 @@ vi ~/.gitconfig
 
 ![](./image/1.PNG)
 
+KGGAUNOTDYBYUCRA
+
 - 生成补丁
 
 ```bash
