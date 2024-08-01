@@ -126,6 +126,12 @@ MGLRU,回收时只会回收申请zone的最老一代，若申请zone的最老一
 但其他zone的最老一代有比较多的cold，这些page将得不到回收，修复这个问题
 ```
 
+- [v5,3/4] mm: support large folios swapin as a whole for zRAM-like swapfile
+
+```textile
+邮件讨论里有swapin相关
+```
+
 
 
 # 快起方面
