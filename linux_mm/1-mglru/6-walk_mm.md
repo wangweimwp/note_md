@@ -224,7 +224,7 @@ restart:
 		      !folio_test_swapcache(folio))) //pte为脏&&对应的folio不为脏&&不为匿名folio && folio有swapbacked && filio没有swapcache
 			folio_mark_dirty(folio);
 
-		old_gen = folio_update_gen(folio, new_gen);//给filio升一代，这里只更新folio的flag，没用将folio放到新的lrugen->list上，后边在evict_folios->isolate_folios->scan_folios->sort_folio中，if (gen != lru_gen_from_seq(lrugen->min_seq[type]))成立，移动到新的lrugen->list上，还有inc_min_seq中也会移动
+		old_gen = folio_update_gen(folio, new_gen);//给filio升到当前最年轻一代，这里只更新folio的flag，没用将folio放到新的lrugen->list上，后边在evict_folios->isolate_folios->scan_folios->sort_folio中，if (gen != lru_gen_from_seq(lrugen->min_seq[type]))成立，移动到新的lrugen->list上，还有inc_min_seq中也会移动
 		if (old_gen >= 0 && old_gen != new_gen)
 			update_batch_size(walk, folio, old_gen, new_gen);//更新walk->nr_pages
 	}
