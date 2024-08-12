@@ -126,6 +126,16 @@ MGLRU,回收时只会回收申请zone的最老一代，若申请zone的最老一
 但其他zone的最老一代有比较多的cold，这些page将得不到回收，修复这个问题
 ```
 
+mm: pgtable: try to reclaim empty PTE pages in zap_page_range_single()
+
+```textile
+现在，为了追求高性能，应用程序大多使用一些高性能的用户模式内存分配器，
+比如jemalloc或tcmalloc。这些内存分配器使用madvise(MADV_DONTNEED或
+MADV_FREE)来释放物理内存，但是MADV_DONTNEED和MADV_FREE都不会释放页表内存，
+这可能会导致大量页表内存的使用。对于这样一个所有条目都为空的PTE页面，
+我们实际上可以将其释放回系统供其他人使用
+```
+
 
 
 # 快起方面

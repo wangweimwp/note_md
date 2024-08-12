@@ -58,6 +58,8 @@ split_huge_pmd这个函数就是只切分一个进程里大页的映射,其他�
 
 ![](./image/8.PNG)
 
+DAX   =  direct-access (dax) mapping
+
 **thp测试代码**
 
 ```c
