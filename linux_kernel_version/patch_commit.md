@@ -134,9 +134,15 @@ mm: pgtable: try to reclaim empty PTE pages in zap_page_range_single()
 MADV_FREE)来释放物理内存，但是MADV_DONTNEED和MADV_FREE都不会释放页表内存，
 这可能会导致大量页表内存的使用。对于这样一个所有条目都为空的PTE页面，
 我们实际上可以将其释放回系统供其他人使用
+
+
 ```
 
+- [v5,3/4] mm: support large folios swapin as a whole for zRAM-like swapfile
 
+```textile
+邮件讨论里有swapin相关
+```
 
 # 快起方面
 
