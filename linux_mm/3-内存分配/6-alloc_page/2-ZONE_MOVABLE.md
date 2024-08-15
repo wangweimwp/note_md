@@ -58,3 +58,177 @@ static inline enum zone_type gfp_zone(gfp_t flags)
     return ZONE_NORMAL;
 }
 ```
+
+
+
+Linux内存管理子系统把内存划分为不同zone，本文主要来介绍下其中的一个：ZONE_MOVABLE。我在网上看到一些文章经常会把它叫做虚拟内存区（pseudo zone），为什么说它是一个虚拟内存区呢？实际上它是从平台中最高内存区中（比如ZONE_HIHGMEM）划出了一部分内存，作为ZONE_MOVABLE。内核中有如下代码可以作为参考依据：
+```c
+ static void __init find_usable_zone_for_movable(void)
+ {
+     int zone_index;
+     for (zone_index = MAX_NR_ZONES - 1; zone_index >= 0; zone_index--) {
+         if (zone_index == ZONE_MOVABLE)
+             continue;
+
+         if (arch_zone_highest_possible_pfn[zone_index] >
+                 arch_zone_lowest_possible_pfn[zone_index])
+             break;
+     }
+
+     VM_BUG_ON(zone_index == -1);
+     movable_zone = zone_index;
+ }
+
+
+```
+那么引入该内存区的目的是什么？
+
+它存在的意义实际上是为了减少内存的碎片化，想象一下这个场景，当我们需要一块大的连续内存时向伙伴系统申请，虽然对应的内存区剩余内存还很多，但是却发现对应的内存区并无法满足连续的内存申请需求，这就是由于内存碎片化导致的问题。那么此时是可以通过内存迁移来完成连续内存的申请，但是这个过程并不一定能够成功，因为中间有一些页面可能是不允许迁移的。
+
+引入ZONE_MOVABLE就是为了优化内存迁移场景的，主要目的是想要把Non-Movable和Movable的内存区分管理，当我们划分出该区域后，那么只有可迁移的页才能够从该区域申请，这样当我们后面回收内存时，针对该区域就都可以执行迁移，从而保证能够获取到足够大的连续内存。
+
+除了这个用途之外，该区域还有一种使用场景，那就是memory hotplug场景，内存热插拔场景，当我们对内存区执行remove时，必须保证其中的内容都是可以被迁移走的，因此热插拔的内存区必须位于ZONE_MOVABLE区域。
+
+**ZONE_MOVABLE**
+内核中定义了如下一些管理区zone：
+
+```c
+enum zone_type {
+#ifdef CONFIG_ZONE_DMA
+    /*
+     * ZONE_DMA is used when there are devices that are not able
+     * to do DMA to all of addressable memory (ZONE_NORMAL). Then we
+     * carve out the portion of memory that is needed for these devices.
+     * The range is arch specific.
+     *
+     * Some examples
+     *
+     * Architecture     Limit
+     * ---------------------------
+     * parisc, ia64, sparc  <4G
+     * s390         <2G
+     * arm          Various
+     * alpha        Unlimited or 0-16MB.
+     *
+     * i386, x86_64 and multiple other arches
+     *          <16M.
+     */
+    ZONE_DMA,
+#endif
+#ifdef CONFIG_ZONE_DMA32
+    /*
+     * x86_64 needs two ZONE_DMAs because it supports devices that are
+     * only able to do DMA to the lower 16M but also 32 bit devices that
+     * can only do DMA areas below 4G.
+     */
+    ZONE_DMA32,
+#endif
+    /*
+     * Normal addressable memory is in ZONE_NORMAL. DMA operations can be
+     * performed on pages in ZONE_NORMAL if the DMA devices support
+     * transfers to all addressable memory.
+     */
+    ZONE_NORMAL,
+#ifdef CONFIG_HIGHMEM
+    /*
+     * A memory area that is only addressable by the kernel through
+     * mapping portions into its own address space. This is for example
+     * used by i386 to allow the kernel to address the memory beyond
+     * 900MB. The kernel will set up special mappings (page
+     * table entries on i386) for each page that the kernel needs to
+     * access.
+     */
+    ZONE_HIGHMEM,
+#endif
+    ZONE_MOVABLE,
+    __MAX_NR_ZONES
+};
+
+
+```
+**ZONE_DMA**
+该管理区是一些设备无法使用DMA访问所有地址的范围，因此特意划分出来的一块内存，专门用于特殊DMA访问分配使用的区域。比如x86架构此区域为0-16M
+**ZONE_NORMAL**
+NORMAL区域是直接映射区。
+**ZONE_HIGHMEM**
+高端内存管理区，申请的内存，需要内核进行map后才能访问。对于64bit Arch架构，我们一般不需要高端内存区，因为地址空间足够映射所有的物理内存。
+**ZONE_MOVABLE**
+可移除内存区，这是一个虚拟内存区，一般是从平台的最高内存区（比如HIGHMEM）中划分出一部分作为MOVABLE ZONE。
+
+**简单来说，可迁移的页面不一定都在ZONE_MOVABLE中，但是ZONE_MOVABLE中的页面必须都是可迁移的。**
+
+我们通过查看 /proc/pagetypeinfo 的返回信息可以看到在Movable Zone中不存在Unmovable类型的页面，只有Movable类型的页面。
+
+这个管理区域存放的page都是可迁移的，只能被带有__GFP_HIGHMEM和__GFP_MOVABLE标志的内存申请所使用，比如：
+```c
+#define GFP_HIGHUSER_MOVABLE    (GFP_HIGHUSER | __GFP_MOVABLE)
+
+#define GFP_USER    (__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
+#define GFP_HIGHUSER    (GFP_USER | __GFP_HIGHMEM)
+```
+主要注意的是不要把分配标志__GFP_MOVABLE和管理区ZONE_MOVABLE混淆，两者并不是对应的关系。
+
+__GFP_MOVABLE表示的是一种分配页面属性，表示页面可迁移，即使不在ZONE_MOVABLE管理区，有些页面也是可以迁移的，比如cache；
+ZONE_MOVABLE表示的是管理区，其中的页面必须要可迁移。
+**分配标志__GFP_MOVABLE**
+```c
+#define __GFP_DMA   ((__force gfp_t)___GFP_DMA)
+#define __GFP_HIGHMEM   ((__force gfp_t)___GFP_HIGHMEM)
+#define __GFP_DMA32 ((__force gfp_t)___GFP_DMA32)
+#define __GFP_MOVABLE   ((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
+#define GFP_ZONEMASK    (__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+```
+分配标志__GFP_MOVABLE
+```c
+#define __GFP_DMA   ((__force gfp_t)___GFP_DMA)
+#define __GFP_HIGHMEM   ((__force gfp_t)___GFP_HIGHMEM)
+#define __GFP_DMA32 ((__force gfp_t)___GFP_DMA32)
+#define __GFP_MOVABLE   ((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
+#define GFP_ZONEMASK    (__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
+```
+这几个分配标志被称为Zone modifiers，他们用来标识优先从哪个zone分配内存。
+```c
+bit       result
+=================
+0x0    => NORMAL
+0x1    => DMA or NORMAL
+0x2    => HIGHMEM or NORMAL
+0x3    => BAD (DMA+HIGHMEM)
+0x4    => DMA32 or DMA or NORMAL
+0x5    => BAD (DMA+DMA32)
+0x6    => BAD (HIGHMEM+DMA32)
+0x7    => BAD (HIGHMEM+DMA32+DMA)
+0x8    => NORMAL (MOVABLE+0)
+0x9    => DMA or NORMAL (MOVABLE+DMA)
+0xa    => MOVABLE (Movable is valid only if HIGHMEM is set too)
+0xb    => BAD (MOVABLE+HIGHMEM+DMA)
+0xc    => DMA32 (MOVABLE+DMA32)
+0xd    => BAD (MOVABLE+DMA32+DMA)
+0xe    => BAD (MOVABLE+DMA32+HIGHMEM)
+0xf    => BAD (MOVABLE+DMA32+HIGHMEM+DMA)
+```
+一共有4个bit用来表示组合类型，其中低3个bit只能选择一个（__GFP_DMA/__GFP_HIGHMEM/__GFP_DMA32），而__GFP_MOVABLE可以和其他三种的任何一个组合使用，因此一共有16中组合，根据各种类型进行一个偏移存放到一个long类型table中。
+```c
+GFP_ZONE_TABLE：
+
+|BAD|BAD|BAD|DMA32|BAD|MOVABLE|......|NORMAL|
+```
+这些结果会根据上面的bit组合值做一个偏移，存放到ZONE TABLE中，从而可以根据组合快速定位要使用的ZONE管理区。由上可见，__GFP_MOVABLE代表的是一种分配策略，并不是和ZONE_MOVABLE匹配的，上一节也做了介绍，必须是（__GFP_HIGHMEM和__GFP_MOVABLE）同时置位才会从ZONE_MOVABLE管理区去分配内存。
+```c
+The zone fallback order is MOVABLE=>HIGHMEM=>NORMAL=>DMA32=>DMA
+```
+因此我们分配内存时并不一定就会按照传入的FLAG来进行分配，如果对应zone中没有符合要求的内存，那么会依次进行fallback查找符合要求的内存。
+
+如何使能ZONE_MOVABLE
+可以通过传入不同的cmdline来设置：
+
+比如kernelcore=YYYY和movablecore=ZZZZ分别表示不同的含义：
+```c
+1) When kernelcore=YYYY boot option is used,
+   Size of memory not for movable pages (not for offline) is YYYY.
+   Size of memory for movable pages (for offline) is TOTAL-YYYY.
+
+2) When movablecore=ZZZZ boot option is used,
+   Size of memory not for movable pages (not for offline) is TOTAL - ZZZZ.
+   Size of memory for movable pages (for offline) is ZZZZ.
+```
