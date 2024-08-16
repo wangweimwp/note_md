@@ -95,7 +95,7 @@ ksys_read
                                 ->folio_add_lru
                             ->filemap_read_folio
                             ->folio_batch_add
-                        ->filemap_readahead        //若查找到的page是PG_readahead调用page_cache_async_readahead()进行异步预读
+                        ->filemap_readahead        //若查找到的page是PG_readahead,说明用户读到了pagecache的末尾页，则page_cache_async_readahead()进行异步预读更多页进来
                             ->page_cache_async_ra        //异步读取page cache
                                 ->ondemand_readahead    //最终调到aops->readahead，最终发送一些列bio
                         ->filemap_update_page    
