@@ -43,10 +43,51 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 		goto out;
 
 	entry = pte_to_swp_entry(vmf->orig_pte);
-	.....
-    /*处理Unaddressable device memory support情况， 这里不做讨论
-    Documentation/mm/hmm.rst*/
-    .....
+	if (unlikely(non_swap_entry(entry))) {
+		if (is_migration_entry(entry)) {
+			migration_entry_wait(vma->vm_mm, vmf->pmd,
+					     vmf->address);//如果没有swap entry要进一步检查是否是migration等状态
+		} else if (is_device_exclusive_entry(entry)) {    /*处理Unaddressable device memory support情况， 这里不做讨论       Documentation/mm/hmm.rst*/
+			vmf->page = pfn_swap_entry_to_page(entry);
+			ret = remove_device_exclusive_entry(vmf);
+		} else if (is_device_private_entry(entry)) {
+			if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+				/*
+				 * migrate_to_ram is not yet ready to operate
+				 * under VMA lock.
+				 */
+				vma_end_read(vma);
+				ret = VM_FAULT_RETRY;
+				goto out;
+			}
+
+			vmf->page = pfn_swap_entry_to_page(entry);
+			vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+					vmf->address, &vmf->ptl);
+			if (unlikely(!vmf->pte ||
+				     !pte_same(ptep_get(vmf->pte),
+							vmf->orig_pte)))
+				goto unlock;
+
+			/*
+			 * Get a page reference while we know the page can't be
+			 * freed.
+			 */
+			get_page(vmf->page);
+			pte_unmap_unlock(vmf->pte, vmf->ptl);
+			ret = vmf->page->pgmap->ops->migrate_to_ram(vmf);
+			put_page(vmf->page);
+		} else if (is_hwpoison_entry(entry)) {
+			ret = VM_FAULT_HWPOISON;
+		} else if (is_pte_marker_entry(entry)) {
+			ret = handle_pte_marker(vmf);
+		} else {
+			print_bad_pte(vma, vmf->address, vmf->orig_pte, NULL);
+			ret = VM_FAULT_SIGBUS;
+		}
+		goto out;
+	}
+
 	/* Prevent swapoff from happening to us. */
 	si = get_swap_device(entry);
 	if (unlikely(!si))
@@ -98,12 +139,12 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 
 				/* To provide entry to swap_read_folio() */
 				folio->swap = entry;
-				swap_read_folio(folio, true, NULL);
+				swap_read_folio(folio, true, NULL);//跳过swapcache直接从磁盘中读，加快读取速度
 				folio->private = NULL;
 			}
 		} else {
 			page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
-						vmf);
+						vmf);//通过swapcache读，这样系统会多读一些页面到缓存起来
 			if (page)
 				folio = page_folio(page);
 			swapcache = folio;
