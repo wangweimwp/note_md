@@ -41,3 +41,7 @@ CMA区域分为全局CMA区域和设备私有CMA区域。全局CMA区域是由�
 3，内核allocpage申请内存时，将从首选zone中分配页面，若MIGRATE_MOVABLE页面不足，则从MIGRATE_CMA中分配，
 
 4，如还分配不出来，进而寻找下个zone中的MIGRATE_MOVABLE和MIGRATE_CMA页面
+
+
+# 注意
+ZONE_MOVABLE 与CMA内存，两者都是可移动页面，用于分配大块内存，但两者分配优先级不同，对于ZONE_MOVABLE，当有用户申请可移动页面是，内核会优先分配ZONE_MOVABLE的页面，而对于CMA，内核优先从MIGRATE_MOVABLE中分配，当内存不足时才会从CMA分配。因此，当内存紧张时内核若要申请不可移动内存，即使CMA有空闲内存也有可能分配失败。

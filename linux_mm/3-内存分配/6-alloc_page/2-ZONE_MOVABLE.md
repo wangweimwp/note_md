@@ -1,4 +1,9 @@
 ZONE_MOVABLE虚拟内存区域
+
+
+# 注意
+ZONE_MOVABLE 与CMA内存，两者都是可移动页面，用于分配大块内存，但两者分配优先级不同，对于ZONE_MOVABLE，当有用户申请可移动页面是，内核会优先分配ZONE_MOVABLE的页面，而对于CMA，内核优先从MIGRATE_MOVABLE中分配，当内存不足时才会从CMA分配。因此，当内存紧张时内核若要申请不可移动内存，即使CMA有空闲内存也有可能分配失败。
+
 **前言**
 ZONE_MOVABLE是一个虚拟内存域，ZONE_MOVABLE内存区域的范围实际上会覆盖高端内存或者NORMAL内存。
 
