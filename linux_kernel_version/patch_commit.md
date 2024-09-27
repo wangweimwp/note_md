@@ -144,6 +144,12 @@ MADV_FREE)来释放物理内存，但是MADV_DONTNEED和MADV_FREE都不会释放
 邮件讨论里有swapin相关
 ```
 
+- [v2,2/2] mm: Compute first_set_pte to eliminate evaluating redundant ranges
+```
+作者提交的补丁有性能回退，看看是否能在作者基础上优化
+```
+
+
 # 快起方面
 
 - mm: pass nid to reserve_bootmem_region()
