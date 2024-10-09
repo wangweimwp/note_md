@@ -16,7 +16,7 @@ static int __init memory_tier_init(void)
     mutex_lock(&memory_tier_lock);
     /*
      * For now we can have 4 faster memory tiers with smaller adistance
-     * than default DRAM tier.初始化default_dram_type 结构体，访问距离为
+     * than default DRAM tier.初始化default_dram_type 结构体，访问距离为MEMTIER_ADISTANCE_DRAM
      */
     default_dram_type = mt_find_alloc_memory_type(MEMTIER_ADISTANCE_DRAM,
                               &default_memory_types);
