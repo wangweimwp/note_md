@@ -69,3 +69,51 @@ static int top_tier_adistance;
  *
  */
 ```
+
+
+ACPI hmat（ACPI Heterogeneous Memory Attribute Table）使用了内存分层
+```c
+hmat_init
+    ->解析ACPI table中获取hmat信息
+    ->hmat_set_default_dram_perf  初始化每个节点的内存读写贷款和读写延时
+    ->register_mt_adistance_algorithm 注册abstrac distance算法
+```
+
+
+
+memory_tier初始化
+
+```c
+memory_tier_init
+    ->set_node_memory_tier//初始化每个内存节点的pgdat->memtier
+
+```
+
+
+
+直接访问（Direct Access，DAX） 中的应用
+
+dax kmem
+
+```c
+dev_dax_kmem_probe
+    ->mt_calc_adistance    //计算距离
+    ->kmem_find_alloc_memory_type    //申请struct memory_dev_type 并挂到kmem_memory_types列表
+    ->init_node_memory_type    // 将 struct memory_dev_type放到node_memory_types数组中
+```
+
+扫描LRU列表时
+
+```c
+shrink_folio_list
+    ->demote_folio_list
+        ->next_demotion_node    //获取demotion路径上的下一个节点
+        ->node_get_allowed_targets    //获取pgdat->memtier->lower_tier_mask
+        ->migrate_pages        //页面迁移
+```
+
+
+
+
+
+
