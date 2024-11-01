@@ -18,3 +18,8 @@
 # 阿里 OpenAnolis 龙蜥社区
 
 源码：[OpenAnolis 龙蜥社区 - OpenAnolis 龙蜥社区](https://gitee.com/openanolis)
+
+
+# 好文地址
+
+https://segmentfault.com/a/1190000044289372
