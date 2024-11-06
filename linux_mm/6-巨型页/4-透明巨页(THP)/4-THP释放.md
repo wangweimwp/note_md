@@ -1,4 +1,10 @@
-假设进程使用munmap释放虚拟内存区域，而这个虚拟内存区域可能映射到透明巨型页，可能是释放巨型页的一部分，也可能是释放整个巨型页。
+假设进程使用munmap释放虚拟内存区域，而这个虚拟内存区域可能映射到透明巨型页，可能是释放巨型页的一部分，也可能是释放整个巨型页。旧版本内核会将THP先split成order=0的小页，再释放掉munmap的页，新版本的内核将页面分裂成低阶的页面，The purpose is to minimize the
+number of folios after the split. For example, if user wants to free the
+3rd subpage in a order-9 folio, folio_split() will split the order-9 folio
+as:
+O-0, O-0, O-0, O-0, O-2, O-3, O-4, O-5, O-6, O-7, O-8 if it is anon
+O-1,      O-0, O-0, O-2, O-3, O-4, O-5, O-6, O-7, O-9 if it is pagecache
+Since anon folio does not support order-1 yet.
 
 函数unmap_single_vma负责删除一个虚拟内存区域，执行流程如图3.79所示。如果虚拟内存区域使用普通页或透明巨型页，把主要工作委托给函数unmap_page_range
 
