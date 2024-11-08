@@ -31,6 +31,14 @@ return 1000 - div_u64( (1000+(div_u64(info->free_pages * 1000ULL, requested))), 
 
 
 ## 问题一：
-在申请页面时进行内存规整（被动规整）和`echo 1 > /proc/sys/vm/compact_memory`（主动规整）的区别
+在申请页面时进行内存规整（被动规整）和`echo 1 > /proc/sys/vm/compact_memory`（主动规整）的区别？
+
+
 1. 主动规整会对所有zone进行规整，而被动规整只会规整申请页面时选定的zone
 2. 二者结束条件不同，被动回收检测到水位满足特定条件即可结束，或者两个扫描指针（migrate_pfn、free_pfn）相遇。而主动规整需要两个扫描指针相遇才会结束
+
+## 问题二
+unmovable的页面是否可以被compact？
+
+slab申请的页不会挂到lru链表上，也不会作为ksm的目标，因而也就是不会被规整（或者说页不会被迁移），所以不用担心slab会乱套；此外，不可移动页确实也是能迁移的，但是有特殊的要求，就是lru链表上的页，而lru链表上的不可移动页，我理解就只有文件页和被mlock住的匿名页了，而文件页并没有做什么映射动作，只是挂在文件address_space的radix树里面，所以，只需要把old page取下来，替换成newpage上去即可
+
