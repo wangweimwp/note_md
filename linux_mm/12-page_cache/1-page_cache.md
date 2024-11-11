@@ -22,6 +22,15 @@ invalidate_mapping_pages
 //echo 1 > drop_cache会遍历文件系统struct adress_space里的page，将没有被mapped页
 //read进来的page cache没有映射到用户空间，__map_count为0，所以drop_cache会清除page cache
 ```
+缺页中断文件页面处理流程
+```c
+do_read_fault
+	->__do_fault
+		->vma->vm_ops->fault(ext4_filemap_fault)
+			->filemap_fault
+			->do_async_mmap_readahead or do_sync_mmap_readahead
+	->alloc_set_pte//这里会增加__map_count，因此在drop_cache时不会被清掉
+```
 
 **drop_cache能drop掉hugetlbfs文件的pagecache吗？**
 
