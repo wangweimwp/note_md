@@ -165,3 +165,15 @@ memmap_init_reserved_pages()  67ms
 after:
 memmap_init_reserved_pages()  20ms
 ```
+# 社区讨论中
+
+* [RFCv1 0/6] Page Detective
+  
+```context
+page 数据探测，可以做成驱动，用于探测内存数据
+```
+
+* [PATCHSET v5 0/17] Uncached buffered IO
+```context
+新增 Uncached特性，用于快速释放只读写一次的pagecache，有效节省内存
+```
