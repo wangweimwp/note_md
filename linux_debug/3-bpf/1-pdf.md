@@ -1,3 +1,12 @@
+环境搭建
+```bash
+sudo apt-get install bpfcc-tools 
+
+sudo apt install bpftrace -y
+```
+
+
+
 ```bash
 tracepoint类的参数用args->count       kprobe类的参数用arg0，arg1.....argN
 
