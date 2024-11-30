@@ -149,7 +149,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
         ...
         shadow = get_shadow_from_swap_cache(entry);
         if (shadow)
-            workingset_refault(folio, shadow);//有shadow值，书名发生了refault，计算refault distance
+            workingset_refault(folio, shadow);//有shadow值，说明发生了refault，计算refault distance
         ...
     }
     ...    
@@ -379,3 +379,7 @@ bool workingset = folio_test_workingset(folio);
     if (unlikely(workingset))
         psi_memstall_leave(&pflags);
 ```
+
+* 问题1：页面的refault distance值存储在那里
+1 对于文件页面，在页面第一次加入page_cache时（filemap_add_folio），在address_space->i_pages（struct Xarray）中申请一个solt（以filio->index为索引），用来存储refault distance
+2 对于匿名页面，在页面第一次被swap out（__remove_mapping）时，会将refault distance值记录在swap cache的xarray中
