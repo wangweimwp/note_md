@@ -177,3 +177,42 @@ page 数据探测，可以做成驱动，用于探测内存数据
 ```context
 新增 Uncached特性，用于快速释放只读写一次的pagecache，有效节省内存
 ```
+
+# 工作清单
+探测机制
+1，PSI		一个或多个进程因为等待内存申请而造成的时间停顿超过了阈值，将触发通知事件
+2，碎片指数	当前内存无法分配的原因是由于低内存还是外部碎片导致
+
+
+优化机制
+1 内存规整
+	规整阈值
+	主动规整
+	预应性规整
+	
+2 drop_cache
+3 利用ZONE_MOVABLE优化内存碎片
+
+策略
+1，分配一定内存到ZONE_MOVABLE中
+2，设置PSI阈值，有通知时触发预应性主动内存规整
+3，检测到有突发的大量文件读写后触发一次drop_cache和主动规整
+4，oomd工具
+5，统计设备运行各个order的页面数量，对每个order进行加权，计算出一个整体的碎片指数
+	当检测到碎片后进行一次预应性规整，会检测个别order是否有空闲页面，若没有进行预应性规整
+	若规整后任没有大块页面进行报警并记录日志
+6，之前没有设置uncached的页面，后边设置uncached后会在下次读取后swap出去吗
+7，uncached特性与refault distance互动，在page cache读取时检测refault distance值，
+	若值大于active_num,说明短期内不会再次读取，设置uncached标记，此次读取后清出page cache
+
+
+
+如何检测系统page_cache的数量，那些是可以清掉的，那些不可以   
+如何将只使用一次的pagecache尽快清除掉		 RWF_UNCACHED特性 https://lore.kernel.org/all/20241108174505.1214230-1-axboe@kernel.dk/
+
+将uncached特性与refault distance特性相节后
+1，若发现xarray树中有这个page的shadow，若在下次读取这个页面前，这个页面有可能被清出lru，则设置uncached flag
+2，当page cache被访问时，会更新shadow值，因此短暂出现连续读该page，再第二次读时判断refault distance小于active lru，则会加入到active中
+
+
+static_assert静态断言解决hal_bsp可能引起的错位问题
