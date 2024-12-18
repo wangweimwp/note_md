@@ -132,6 +132,25 @@ void *workingset_eviction(struct folio *folio, struct mem_cgroup *target_memcg)
 }
 ```
 
+```c
+//检测到uncached
+page_unmap_invalidate
+	->invalidate_complete_page2
+		->__delete_from_page_cache   此时没有传入shadow
+		
+//drop_cached时
+invalidate_inode_page
+	->invalidate_complete_page
+		->remove_mapping
+			->__remove_mapping
+				->__delete_from_page_cache		reclaimed为false，此时没有传入shadow
+
+//扫描lru时
+shrink_page_list
+	->__remove_mapping
+		->__delete_from_page_cache		reclaimed为true，此时传入shadow
+```
+
 **页面发生refault时**
 
 对于匿名页面，发生缺页中断，若在swap cache中无法找到这个页面，则要从swap分区中读取，并记录refault
