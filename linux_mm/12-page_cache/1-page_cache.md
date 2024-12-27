@@ -115,3 +115,29 @@ ksys_read
 **同步预读**：从存储器件读取多个page数据，一些page给当前的read（触发同步预读的read）使用，一些page留给将来的read使用。
 
 **异步预读**：本次读的page纯粹是为将来准备的，目前用不到。
+
+**写文件结束后清除page脏标记**
+```c
+//后台回写进程
+wb_workfn
+	->wb_do_writeback
+		->wb_writeback
+			->writeback_sb_inodes
+				->__writeback_single_inode
+					->do_writepages
+						->ext4_writepages
+							->write_cache_pages
+								->clear_page_dirty_for_i
+									->TestClearPageDirty(page)
+								->ext4_writepage
+
+//write系统调用
+generic_perform_write
+	->a_ops->write_begin	(ext4_da_write_begin)
+	->iov_iter_copy_from_user_atomic
+	->a_ops->write_end		(ext4_da_write_end)
+		->ext4_da_write_inline_data_end
+			->ext4_write_inline_data_end
+				->SetPageUptodate(page);
+				->ClearPageDirty(page);
+```
