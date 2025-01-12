@@ -216,3 +216,33 @@ page 数据探测，可以做成驱动，用于探测内存数据
 
 
 static_assert静态断言解决hal_bsp可能引起的错位问题
+
+
+
+
+# 可以提的补丁
+```
+https://patchwork.kernel.org/project/linux-mm/patch/20250110182149.746551-3-david@redhat.com/
+
++/**
++ * folio_isolate_hugetlb: try to isolate an allocated hugetlb folio
++ * @folio: the folio to isolate
++ * @list: the list to add the folio to on success
++ *
++ * Isolate an allocated (refcount > 0) hugetlb folio, marking it as
++ * isolated/non-migratable, and moving it from the active list to the
+
+这里改为 LRU list
+
++ * given list.
++ *
++ * Isolation will fail if @folio is not an allocated hugetlb folio, or if
++ * it is already isolated/non-migratable.
++ *
++ * On success, an additional folio reference is taken that must be dropped
++ * using folio_putback_active_hugetlb() to undo the isolation.
++ *
++ * Return: True if isolation worked, otherwise False.
++ */
++bool folio_isolate_hugetlb(struct folio *folio, struct list_head *list)
+```
