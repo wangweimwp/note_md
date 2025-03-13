@@ -74,6 +74,32 @@ struct codetag_type_desc {
 __start_alloc_tags
 
 __stop_alloc_tags
+
+
+
+//两个关键结构体
+//表明申请页面的路径
+struct codetag {
+	unsigned int flags; /* used in later patches */
+	unsigned int lineno;
+	const char *modname;
+	const char *function;
+	const char *filename;
+} __aligned(8);
+
+union codetag_ref {
+	struct codetag *ct;
+};
+
+
+//不仅包含了页面申请路径还包含了申请次数和内存大小
+struct alloc_tag {
+	struct codetag			ct;
+	struct alloc_tag_counters __percpu	*counters;
+} __aligned(8);
+
+
+
 ```
 
 
@@ -169,5 +195,91 @@ void codetag_load_module(struct module *mod)
 	list_for_each_entry(cttype, &codetag_types, link)
 		codetag_module_init(cttype, mod);
 	mutex_unlock(&codetag_lock);
+}
+```
+
+
+## 申请页面时
+```c
+申请page时
+get_page_from_freelist
+	->prep_new_page
+		->post_alloc_hook
+			->pgalloc_tag_add
+			
+
+static inline void pgalloc_tag_add(struct page *page, struct task_struct *task,
+				   unsigned int nr)
+{
+	if (mem_alloc_profiling_enabled()) {
+		union pgtag_ref_handle handle;
+		union codetag_ref ref;
+
+		if (get_page_tag_ref(page, &ref, &handle)) {//拿到这个page的struct codetag结构体放到ref中
+			//增加struct alloc_tag的调用次数和字节数 并把 alloc_tag->ct赋值给ref->ct
+			alloc_tag_add(&ref, task->alloc_tag, PAGE_SIZE * nr);
+			update_page_tag_ref(handle, &ref);//更新page->flag中的idx（偏移值）指向新的struct codetag（struct codetag表明了page的申请路劲）。
+			put_page_tag_ref(handle);
+		}
+	}
+}
+
+/* Should be called only if mem_alloc_profiling_enabled() */
+static inline bool get_page_tag_ref(struct page *page, union codetag_ref *ref,
+				    union pgtag_ref_handle *handle)
+{
+	if (!page)
+		return false;
+
+	if (static_key_enabled(&mem_profiling_compressed)) {
+		pgalloc_tag_idx idx;
+		/*
+		Page flags: | [SECTION] | [NODE] | ZONE | [LAST_CPUPID] | ... | FLAGS | 
+		从page flag里存放了struct codetag的偏移值，拿到idx
+		*/
+		idx = (page->flags >> alloc_tag_ref_offs) & alloc_tag_ref_mask;
+		idx_to_ref(idx, ref);//根据idx（偏移值）从__start_alloc_tags段中找到对应的struct codetag结构体
+		handle->page = page;
+	} else {
+		struct page_ext *page_ext;
+		union codetag_ref *tmp;
+
+		page_ext = page_ext_get(page);
+		if (!page_ext)
+			return false;
+
+		tmp = (union codetag_ref *)page_ext_data(page_ext, &page_alloc_tagging_ops);
+		ref->ct = tmp->ct;
+		handle->ref = tmp;
+	}
+
+	return true;
+}
+
+static inline void update_page_tag_ref(union pgtag_ref_handle handle, union codetag_ref *ref)
+{
+	if (static_key_enabled(&mem_profiling_compressed)) {
+		struct page *page = handle.page;
+		unsigned long old_flags;
+		unsigned long flags;
+		unsigned long idx;
+
+		if (WARN_ON(!page || !ref))
+			return;
+
+		idx = (unsigned long)ref_to_idx(ref);//根据struct codetag在__start_alloc_tags段中的偏移值计算idx
+		idx = (idx & alloc_tag_ref_mask) << alloc_tag_ref_offs;
+		do {
+			old_flags = READ_ONCE(page->flags);
+			flags = old_flags;
+			flags &= ~(alloc_tag_ref_mask << alloc_tag_ref_offs);
+			flags |= idx;//将新的idx放到page->flags中
+		} while (unlikely(!try_cmpxchg(&page->flags, &old_flags, flags)));
+	} else {
+		if (WARN_ON(!handle.ref || !ref))
+			return;
+
+		handle.ref->ct = ref->ct;
+	}
 }
 ```
