@@ -283,3 +283,51 @@ static inline void update_page_tag_ref(union pgtag_ref_handle handle, union code
 	}
 }
 ```
+
+
+## 打印内存申请信息时
+```c
+struct codetag *codetag_next_ct(struct codetag_iterator *iter)
+{
+	struct codetag_type *cttype = iter->cttype;
+	struct codetag_module *cmod;
+	struct codetag *ct;
+
+	lockdep_assert_held(&cttype->mod_lock);
+
+	if (unlikely(idr_is_empty(&cttype->mod_idr)))
+		return NULL;
+
+	ct = NULL;
+	while (true) {
+        /*
+        cttype上挂了各个驱动和内核本身的codetag_type_desc
+        每个codetag_type_desc有包含了alloc_tag段的起始结束地址，先通过mod_id拿到一个模块的codetag_type_desc
+        */
+		cmod = idr_find(&cttype->mod_idr, iter->mod_id);
+
+		/* If module was removed move to the next one */
+		if (!cmod)
+			cmod = idr_get_next_ul(&cttype->mod_idr,
+					       &iter->mod_id);
+
+		/* Exit if no more modules */
+		if (!cmod)
+			break;
+
+		if (cmod != iter->cmod) {
+			iter->cmod = cmod;
+			ct = get_first_module_ct(cmod);
+		} else
+			ct = get_next_module_ct(iter);//然后遍历这个codetag_type_desc上的每个codetag
+
+		if (ct)
+			break;
+
+		iter->mod_id++;//若ct==NULL说明这个模块遍历完了。mod_id++遍历下个模块
+	}
+
+	iter->ct = ct;
+	return ct;
+}
+```
