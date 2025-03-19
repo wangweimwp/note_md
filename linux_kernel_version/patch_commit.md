@@ -171,6 +171,7 @@ memmap_init_reserved_pages()  20ms
   
 ```context
 page 数据探测，可以做成驱动，用于探测内存数据
+https://lore.kernel.org/all/20241116175922.3265872-1-pasha.tatashin@soleen.com/
 ```
 
 * [PATCHSET v5 0/17] Uncached buffered IO
