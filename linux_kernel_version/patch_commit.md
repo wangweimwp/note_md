@@ -148,7 +148,12 @@ MADV_FREE)来释放物理内存，但是MADV_DONTNEED和MADV_FREE都不会释放
 ```
 作者提交的补丁有性能回退，看看是否能在作者基础上优化
 ```
-
+- mm: compaction: push watermark into compaction_suitable() callers
+  
+```c
+//优化内存规整过程中的水位问题，使内存规整更多的规整出连续页面
+https://lore.kernel.org/all/20250313210647.1314586-1-hannes@cmpxchg.org/
+```
 
 # 快起方面
 

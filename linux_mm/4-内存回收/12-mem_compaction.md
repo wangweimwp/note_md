@@ -597,3 +597,41 @@ fragmentation_score_zone和fragmentation_score_wmark均为预应性规整碎片�
 
 
 
+- mm: compaction: push watermark into compaction_suitable() callers
+  
+```c
+//优化内存规整过程中的水位问题，使内存规整更多的规整出连续页面
+__alloc_pages_slowpath	
+	->__alloc_pages_direct_compact	
+		->try_to_compact_pages	
+			->compact_zone_order	
+				->compact_zone
+					->compaction_suit_allocation_order
+	->__alloc_pages_direct_compact	//调了2次
+		->try_to_compact_pages	
+			->compact_zone_order	
+				->compact_zone
+					->compaction_suit_allocation_order
+					
+sysctl_compaction_handler
+	->compact_nodes
+		->compact_node
+			->compact_zone
+				->compaction_suit_allocation_order
+
+kcompactd	
+	->kcompactd_do_work
+		->compaction_suit_allocation_order
+		->compact_zone
+			->compaction_suit_allocation_order			
+	->compact_node
+		->compact_zone
+			->compaction_suit_allocation_order
+
+wakeup_kcompactd	
+	->kcompactd_node_suitable
+		->compaction_suit_allocation_order
+```
+
+
+
