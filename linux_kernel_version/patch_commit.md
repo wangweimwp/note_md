@@ -155,6 +155,10 @@ MADV_FREE)来释放物理内存，但是MADV_DONTNEED和MADV_FREE都不会释放
 https://lore.kernel.org/all/20250313210647.1314586-1-hannes@cmpxchg.org/
 ```
 
+- mm/vmscan: batch TLB flush during memory reclaim
+```
+优化了shrink_folio_list中TLB刷新次数，减小性能开销
+```
 # 快起方面
 
 - mm: pass nid to reserve_bootmem_region()
