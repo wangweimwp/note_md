@@ -601,29 +601,32 @@ fragmentation_score_zone和fragmentation_score_wmark均为预应性规整碎片�
   
 ```c
 //优化内存规整过程中的水位问题，使内存规整更多的规整出连续页面
+
 __alloc_pages_slowpath	
 	->__alloc_pages_direct_compact	
 		->try_to_compact_pages	
 			->compact_zone_order	
 				->compact_zone
-					->compaction_suit_allocation_order
+					->compaction_suit_allocation_order//从 cc->alloc_flags 派生出水位gfp_to_alloc_flags
 	->__alloc_pages_direct_compact	//调了2次
 		->try_to_compact_pages	
 			->compact_zone_order	
 				->compact_zone
-					->compaction_suit_allocation_order
+					->compaction_suit_allocation_order//从 cc->alloc_flags 派生出水位gfp_to_alloc_flags
+	->should_compact_retry
+		->compaction_zonelist_suitable//用于直接回收路径，传入最低水位
 					
 sysctl_compaction_handler
 	->compact_nodes
 		->compact_node
 			->compact_zone
-				->compaction_suit_allocation_order
+				->compaction_suit_allocation_order//从 cc->alloc_flags 派生出水位gfp_to_alloc_flags
 
 kcompactd	
 	->kcompactd_do_work
 		->compaction_suit_allocation_order
 		->compact_zone
-			->compaction_suit_allocation_order			
+			->compaction_suit_allocation_order	//kcompactd 未显式初始化 cc->alloc_flags，但通过内核构建测试确认其隐式行为与 ALLOC_WMARK_MIN 一致（因默认值为0）。为明确意图，显式设置该标志。	
 	->compact_node
 		->compact_zone
 			->compaction_suit_allocation_order
@@ -631,6 +634,10 @@ kcompactd
 wakeup_kcompactd	
 	->kcompactd_node_suitable
 		->compaction_suit_allocation_order
+		
+shrink_node
+	->should_continue_reclaim//传入最低水位
+		->compaction_suitable 
 ```
 
 
