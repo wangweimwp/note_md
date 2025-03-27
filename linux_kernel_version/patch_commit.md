@@ -211,16 +211,17 @@ https://lore.kernel.org/all/20241116175922.3265872-1-pasha.tatashin@soleen.com/
 5，统计设备运行各个order的页面数量，对每个order进行加权，计算出一个整体的碎片指数
 	当检测到碎片后进行一次预应性规整，会检测个别order是否有空闲页面，若没有进行预应性规整
 	若规整后任没有大块页面进行报警并记录日志
-6，之前没有设置uncached的页面，后边设置uncached后会在下次读取后swap出去吗
-7，uncached特性与refault distance互动，在page cache读取时检测refault distance值，
+6，在嵌入式设备中，对于64M设备而言，一般内存水位都设置到1M左右，当因为内存碎片而无法申请到内存时，若内存剩余已经不多，规整出连续页面概率较低，而在内存较为充足时，由于数位较低而不会进行内存规整，尝试提供内存规整的节点，提前进行内存规整。
+7，之前没有设置uncached的页面，后边设置uncached后会在下次读取后swap出去吗
+8，uncached特性与refault distance互动，在page cache读取时检测refault distance值，
 	若值大于active_num,说明短期内不会再次读取，设置uncached标记，此次读取后清出page cache
 
 
 
-如何检测系统page_cache的数量，那些是可以清掉的，那些不可以   
+- 如何检测系统page_cache的数量，那些是可以清掉的，那些不可以   
 如何将只使用一次的pagecache尽快清除掉		 RWF_UNCACHED特性 https://lore.kernel.org/all/20241108174505.1214230-1-axboe@kernel.dk/
 
-将uncached特性与refault distance特性相节后
+- 将uncached特性与refault distance特性相节后
 1，若发现xarray树中有这个page的shadow，若在下次读取这个页面前，这个页面有可能被清出lru，则设置uncached flag
 2，当page cache被访问时，会更新shadow值，因此短暂出现连续读该page，再第二次读时判断refault distance小于active lru，则会加入到active中
 
