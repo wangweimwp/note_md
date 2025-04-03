@@ -596,7 +596,7 @@ fragmentation_score_zone和fragmentation_score_wmark均为预应性规整碎片�
 
 
 
-
+# 内存规整水位优化补丁
 - mm: compaction: push watermark into compaction_suitable() callers
   
 ```c
@@ -640,5 +640,22 @@ shrink_node
 		->compaction_suitable 
 ```
 
+```c
+kswapd
+	->balance_pgdat//初始化 struct scan_control结构体，复制order
+		->kswapd_shrink_node		
+			->shrink_node
+				->should_continue_reclaim//传入最低水位
+					->zone_watermark_ok
+					->compaction_suitable//shrink_node中并没有进行内存压缩，主要是为后需的压缩做准备。检查 zone 的碎片化程度,如果压缩可行，返回 false 停止回收（压缩将直接处理碎片，无需更多回收）
+						->__compaction_suitable
+		
+		
+__zone_watermark_ok
+	->__zone_watermark_unusable_free
+		->unusable_free = (1 << order) - 1; //这里有两种说法 1，剩余内存减去本次申请的页数后计算水位，但是为什么要-1？？？
+											//				 2，计算因内存碎片导致无法满足高阶分配的最小不可用页数，order=2（请求4页）→ 1<<2 -1 = 3，表示最多3个单页因不连续无法组成4页块
+	
+```
 
 
