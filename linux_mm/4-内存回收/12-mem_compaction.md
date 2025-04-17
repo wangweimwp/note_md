@@ -75,7 +75,7 @@ FAQ：
 （3）内存规整中有一个特例就是alloc_contig_range函数，该函数用于分配指定地址区域内存，若这部分内存被占用，会尝试对这段内存进行规整迁移，其并非针对zone的规整，而是针对指定内存区域的规整，它的规整类型与主动内存规整类似，其实现核心是内存规整机制，本文不对此逻辑进行说明。
 ### 2.1 直接内存规整（direct compaction）
 #### 2.1.1 直接内存规整触发条件
-伙伴系统分配内存时，会先以low水线为基准调用get_page_from_freelist函数尝试进行内存分配，如果失败则会进入慢速内存分配流程，即__alloc_pages_slowpath函数，我们对此函数逻辑稍作删减，内容如下：
+伙伴系统分配内存时，会先以low水线为基准调用get_page_from_freelist函数尝试进行内存分配，如果失败则会进入慢速内存分配流程，即__alloc_pages_slowpath函数（其中should_compact_retry会判断是否要重试，会操作compact优先级），我们对此函数逻辑稍作删减，内容如下：
 ![](./image/16.PNG)
 慢速内存分配，会尝试唤醒kswapd进行内存回收，但并不会等待内存回收的结果，而是直接先调用get_page_from_freelist函数尝试内存分配，但这次不同的是使用min水线进行尝试，如果依然失败，那么将会根据gfp标识确认当前分配是否支持直接内存回收，若支持，将会调用__alloc_pages_direct_compact尝试第一次直接内存规整以及内存分配。如果依然失败，则进入唤醒kswapd、get_page_from_freelist、__alloc_pages_direct_reclaim及__alloc_pages_direct_compact循环调用流程里面来，当然这之中存在众多条件判断随时可能返回页分配失败、页分配成功、重试甚至是触发OOM。值得注意的是在慢速内存分配逻辑中，首次调用直接内存规整时其优先级设置为INIT_COMPACT_PRIORITY，这将影响内存规整触发页迁移的类型，比如INIT_COMPACT_PRIORITY对应的就是MIGRATE_ASYNC即异步迁移类型代表页迁移时不会阻塞，当然这样带来的效果就是规整或迁移的能力较弱。慢速内存分配逻辑中后续直接内存规整调用其规整优先级可能会逐步降低（越低对应规整强度越高）从而提升内存规整效用，但是内存规整可能变为阻塞规整，这是相互对应逻辑。
 
@@ -420,7 +420,7 @@ isolate_migratepages_block函数会在单个pageblock内进行遍历，尝试将
 ![](./image/65.PNG)
 ##### 3.2.3.3 non-LRU物理页
 ![](./image/66.PNG)
-这个很有意思，上文谈到大部分可移动页应该都是用户态的匿名页，这里怎么还会有不再LRU上的物理页呢，实际这涉及到页迁移特性的一种功能，有兴趣的朋友可以阅读一下"Documentation/vm/page_migration.rst"文章中"Non-LRU page migration"这一小节。内核中申请的内存通常都是non-LRU上并且不可移动，但是内核提供了定制能力，开发者可以在内核驱动中将自己申请的内存标记为可移动，为此内核为page添加了两个新的flag即PG_movable和PG_isolated用于标识这种non-LRU并且可迁移的页。开发者通常使用__SetPageMovable接口主动设置这些内存页PG_movable标记，而PG_isolated标识此页已经被隔离，开发者不需要主动设置此标记。
+这个很有意思，上文谈到大部分可移动页应该都是用户态的匿名页，这里怎么还会有不再LRU上的物理页呢，实际这涉及到页迁移特性的一种功能，有兴趣的朋友可以阅读一下"Documentation/vm/page_migration.rst"文章中"Non-LRU page migration"这一小节。内核中申请的内存通常都是non-LRU上并且不可移动，但是内核提供了定制能力，开发者可以在内核驱动中将自己申请的内存标记为可移动，为此内核为page添加了两个新的flag即PG_movable和PG_isolated用于标识这种non-LRU并且可迁移的页(slab页面就是non-lru页面)。开发者通常使用__SetPageMovable接口主动设置这些内存页PG_movable标记，而PG_isolated标识此页已经被隔离，开发者不需要主动设置此标记。
 
 现在我们应该可以理解上述代码中对于__PageMovable(page)判断，如果一个non-LRU页被设置了PG_movable并且PG_isolated还未被设置，那么代表这个页也是可以进行迁移，随后将会调用isolate_movable_page函数进行隔离操作。
 
