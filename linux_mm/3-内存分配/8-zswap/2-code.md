@@ -99,7 +99,7 @@ bool zswap_store(struct folio *folio)
 		mem_cgroup_put(memcg);
 	}
 
-	if (zswap_check_limits())
+	if (zswap_check_limits())//zswap占满
 		goto put_objcg;
 
 	pool = zswap_pool_current_get();
@@ -118,7 +118,7 @@ bool zswap_store(struct folio *folio)
 	for (index = 0; index < nr_pages; ++index) {
 		struct page *page = folio_page(folio, index);
 
-		if (!zswap_store_page(page, objcg, pool))
+		if (!zswap_store_page(page, objcg, pool))//压缩page到zswap pool中
 			goto put_pool;
 	}
 
@@ -134,13 +134,17 @@ put_pool:
 put_objcg:
 	obj_cgroup_put(objcg);
 	if (!ret && zswap_pool_reached_full)
-		queue_work(shrink_wq, &zswap_shrink_work);
+		queue_work(shrink_wq, &zswap_shrink_work);//zswap占满，启动工作队列进行后台回写，本质上调用shrink_memcg
 check_old:
 	/*
 	 * If the zswap store fails or zswap is disabled, we must invalidate
 	 * the possibly stale entries which were previously stored at the
 	 * offsets corresponding to each page of the folio. Otherwise,
 	 * writeback could overwrite the new data in the swapfile.
+	 之前可能有一些页面被存储在 zswap 中，对应的交换缓存条目(swap cache entries)仍然存在。
+		这些条目现在可能已经"陈旧"(stale)，因为：
+		zswap 存储失败导致实际数据未正确保存
+		zswap 被禁用后这些缓存不再有效
 	 */
 	if (!ret) {
 		unsigned type = swp_type(swp);
@@ -154,6 +158,102 @@ check_old:
 			if (entry)
 				zswap_entry_free(entry);
 		}
+	}
+
+	return ret;
+}
+
+
+zswap_store_page
+	->zswap_entry_cache_alloc
+	->zswap_compress
+	->xa_store	//存储到xarray树中
+	->zswap_lru_add(&zswap_list_lru, entry); //添加到zswap_list_lru列表上
+	
+shrink_memcg
+	->list_lru_walk_one(&zswap_list_lru, nid, memcg,
+			&shrink_memcg_cb, NULL, &nr_to_walk); //遍历zswap_list_lru上的zswap_entry，调用shrink_memcg_cb
+
+/*
+动态收缩器的调节机制基于以下因素：
+
+1,引用位二次机会机制
+每个zswap条目都设有引用标记位。收缩器首先会清除该标记位（给予条目二次机会）并将其在LRU列表中轮转。若该条目再次被收缩器扫描且引用位仍未被置位，则执行回写操作。这种机制使得回写速率能根据存储池活动动态调整：当池中多为新条目（即近期大量zswap换出）时，这些活跃条目会受到保护，回写速率降低；反之，若池中存在大量陈旧条目，则会立即回收这些条目，实质上提高了回写速率。
+
+2,交换入计数器反馈
+当监测到交换入(swapin)操作时，表明当前收缩过度，应降低回收强度。系统维护一个交换入计数器，该计数器会在zswap_shrinker_count()函数中消耗，并相应减少LRU链表中符合回收条件的对象数量。
+
+3,压缩比感知调节
+工作负载的压缩效率越高，通过回写获得的收益就越小。系统会根据压缩比例动态缩放可供回收的对象数量——压缩比越好，可回收对象数越少。
+*/
+
+static enum lru_status shrink_memcg_cb(struct list_head *item, struct list_lru_one *l,
+				       void *arg)
+{
+	struct zswap_entry *entry = container_of(item, struct zswap_entry, lru);
+	bool *encountered_page_in_swapcache = (bool *)arg;
+	swp_entry_t swpentry;
+	enum lru_status ret = LRU_REMOVED_RETRY;
+	int writeback_result;
+
+	/*
+	 * Second chance algorithm: if the entry has its referenced bit set, give it
+	 * a second chance. Only clear the referenced bit and rotate it in the
+	 * zswap's LRU list.
+	 */
+	if (entry->referenced) {
+		entry->referenced = false;
+		return LRU_ROTATE;
+	}
+
+	/*
+	 当释放LRU锁后，条目可能被并发执行的失效操作释放。这意味着：
+
+	1,交换条目提取与验证机制
+	我们将swp_entry_t提取到栈内存中，使zswap_writeback_entry()能固定该交换条目，随后通过指针值比较来验证zswap条目与交换条目树的匹配性。只有验证成功后，才能解引用该条目。
+
+	2,LRU轮转保护策略
+	常规情况下，对象会从LRU移除进行回收。但此处不可行，因为若回收失败（无论何种原因），我们无法判断条目是否存活以将其重新放回LRU。
+
+	因此需在释放锁前执行轮转操作：
+
+		若条目被成功回写或失效，释放路径会自动解除其链接
+		对于失败情况，轮转同样是正确选择
+		临时性失败（需立即重试同一条目）在该收缩器中几乎不会发生：
+			不采用任何尝试锁机制
+			-ENOMEM是最接近的案例，但极为罕见且不会伪触发
+			无需特别区分此类情况
+	 */
+	list_move_tail(item, &l->list);
+
+	/*
+		一旦释放了LRU锁，该条目可能会被释放。此时会将交换条目（swpentry）复制到栈上，并且在确认该条目在树中仍然存活之前，不会再次对其进行解引用操作。
+	 */
+	swpentry = entry->swpentry;
+
+	/*
+	 * It's safe to drop the lock here because we return either
+	 * LRU_REMOVED_RETRY, LRU_RETRY or LRU_STOP.
+	 */
+	spin_unlock(&l->lock);
+
+	writeback_result = zswap_writeback_entry(entry, swpentry);
+
+	if (writeback_result) {
+		zswap_reject_reclaim_fail++;
+		ret = LRU_RETRY;
+
+		/*
+		 * Encountering a page already in swap cache is a sign that we are shrinking
+		 * into the warmer region. We should terminate shrinking (if we're in the dynamic
+		 * shrinker context).
+		 */
+		if (writeback_result == -EEXIST && encountered_page_in_swapcache) {
+			ret = LRU_STOP;
+			*encountered_page_in_swapcache = true;
+		}
+	} else {
+		zswap_written_back_pages++;
 	}
 
 	return ret;
