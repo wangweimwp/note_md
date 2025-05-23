@@ -91,6 +91,38 @@ Which we track using:
                    v0 := cfs_rq->min_vruntime
 \Sum (v_i - v0) * w_i := cfs_rq->avg_vruntime
              \Sum w_i := cfs_rq->avg_load
+
+V = (cfs_rq->avg_vruntime / cfs_rq->avg_load) +  cfs_rq->min_vruntime
+```
+```c
+/*
+ * Specifically: avg_runtime() + 0 must result in entity_eligible() := true
+ * For this to be so, the result of this function must have a left bias.
+ V（理想vruntime）的计算函数
+ */
+u64 avg_vruntime(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	s64 avg = cfs_rq->avg_vruntime;
+	long load = cfs_rq->avg_load;
+
+	if (curr && curr->on_rq) {//若当前有进程在运行，需将当前进程计算在内
+		unsigned long weight = scale_load_down(curr->load.weight);
+
+		avg += entity_key(cfs_rq, curr) * weight;
+		load += weight;
+	}
+
+	if (load) {
+		/* sign flips effective floor / ceiling */
+		if (avg < 0)
+			avg -= (load - 1);
+		avg = div_s64(avg, load);
+	}
+
+	return cfs_rq->min_vruntime + avg;
+}
+
 ```
 
 Since min_vruntime is a monotonic increasing variable that closely tracks the per-task service, these deltas: (v_i - v), will be in the order of the maximal (virtual) lag induced in the system due to quantisation.
@@ -101,3 +133,20 @@ Also, we use scale_load_down() to reduce the size.
 
 As measured, the max (key * weight) value was ~44 bits for a kernel build.
 实测内核构建时最大(key * weight)值约44位
+
+```c
+ *                    v0 := cfs_rq->min_vruntime   //虚拟时间基点
+ * \Sum (v_i - v0) * w_i := cfs_rq->avg_vruntime 	//加权平均虚拟运行时间  //带avg字样的都是虚拟时间与权重的乘积（加权虚拟时间）
+ *              \Sum w_i := cfs_rq->avg_load		//总权重
+					 v_i := se->vruntime			//虚拟时间（实际时间通过w_i权重缩放后所得）
+  /*
+se->vruntime 计算在update_curr()中
+curr->vruntime += calc_delta_fair(delta_exec, curr);
+curr->vruntime += (now - exec_start) * se->load;
+  */
+V = (cfs_rq->avg_vruntime / cfs_rq->avg_load) +  cfs_rq->min_vruntime	//理想运行时间
+				 V - v_i := se->vlag = 		(cfs_rq->avg_vruntime / cfs_rq->avg_load) +  cfs_rq->min_vruntime -	se->vruntime	//理想运行时间与单个任务虚拟运行时间的差值
+
+cfs_rq->avg_vruntime = (V - cfs_rq->min_vruntime) * cfs_rq->avg_load
+
+```
