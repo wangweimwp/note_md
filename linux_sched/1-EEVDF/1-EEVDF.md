@@ -150,3 +150,20 @@ V = (cfs_rq->avg_vruntime / cfs_rq->avg_load) +  cfs_rq->min_vruntime	//理想�
 cfs_rq->avg_vruntime = (V - cfs_rq->min_vruntime) * cfs_rq->avg_load
 
 ```
+
+由于\Sum w_i * (V - v_i) = 0，理想情况下加入就绪队列前后进程的V - v_i := se->vlag是不变的
+加入就绪队列后，V发生了变化（与cfs_rq->avg_vruntime有关），需要重新计算v_i（se->vruntime）place_entity函数用于计算v_i
+
+```c
+enqueue_task_fair
+	->enqueue_entity
+		->update_curr
+			->update_curr_se
+			->curr->vruntime += calc_delta_fair(delta_exec, curr);
+			->update_min_vruntime
+				->__update_min_vruntime
+				->avg_vruntime_update
+		->place_entity
+		->__enqueue_entity
+		->avg_vruntime_add
+```
