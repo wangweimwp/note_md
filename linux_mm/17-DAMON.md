@@ -47,6 +47,20 @@
 
 问题1：问频率超过50%怎么理解？
 问题2：进行LRU的优先级的提升怎么理解？
+
+//lru_sort会新建一个paddr的检测方案
+kdamond_fn
+	->kdamond_apply_schemes
+		->damon_do_apply_schemes
+			->damos_apply_scheme
+				->ops.apply_scheme = damon_pa_apply_scheme
+					->damon_pa_mark_accessed
+						->damon_pa_mark_accessed_or_deactivate
+							->if (mark_accessed)
+								folio_mark_accessed(folio);
+							else
+								folio_deactivate(folio);
+
 ```
 
 ## 3. DAMON的reclaim用法 超过一定时间未被访问，回收这些页面
