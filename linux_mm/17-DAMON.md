@@ -90,10 +90,25 @@ state_store
 //vaddr模式				
 kdamond_fn
 	->ops.prepare_access_checks = damon_va_prepare_access_checks
+		->__damon_va_prepare_access_check
+			->damon_va_mkold
+				->walk_page_range
+					->damon_mkold_pmd_entry
+						->damon_ptep_mkold
+							->damon_ptep_mkold
+								->pmdp_clear_young_notify
+								->folio_set_young
+								->folio_set_idle
 	->ops.check_accesses = damon_va_check_accesses
+		->__damon_va_check_access
+			->damon_va_young
+				->damon_young_pmd_entry
+					->if (pmd_young(pmde) || !folio_test_idle(folio)
 	->ops.reset_aggregated = NULL
 	->ops.update = damon_va_update		
 	->ops.cleanup = NULL
+
+
 ```
 
 # 代码详解
@@ -246,4 +261,28 @@ static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
 	}
 }
 	
+```
+
+## paddr
+```c
+//paddr模式				
+kdamond_fn
+	->ops.prepare_access_checks = damon_pa_prepare_access_checks
+		->__damon_pa_prepare_access_check
+			->damon_pa_mkold
+				->damon_folio_mkold  //通过物理地址拿到PFN然后拿到struct folio
+					->rmap_walk		//通过反向映射，找到映射这个页的所有进程
+						->damon_folio_mkold_one
+							->ptep_clear_young_notify
+							->folio_set_young(folio);
+							->folio_set_idle(folio);
+	->ops.check_accesses = damon_pa_check_accesses
+		->__damon_pa_check_access
+			->damon_pa_young
+				->damon_folio_young
+					->damon_folio_young_one
+						->*accessed = pte_young(ptep_get(pvmw.pte)) || !folio_test_idle(folio)
+	->ops.reset_aggregated = NULL
+	->ops.update = NULL		
+	->ops.cleanup = NULL
 ```
