@@ -46,6 +46,7 @@
 
 
 问题1：问频率超过50%怎么理解？
+在damon_hot_score函数中
 问题2：进行LRU的优先级的提升怎么理解？
 
 //lru_sort会新建一个paddr的检测方案
@@ -75,6 +76,8 @@ kdamond_fn
 # echo 400 > wmarks_mid
 # echo 200 > wmarks_low
 # echo Y > enabled
+
+reclaim同样采用paddr策略，使用PAGEOUT操作
 ```
 
 # 代码结构
