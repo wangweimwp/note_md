@@ -303,3 +303,8 @@ kdamond_fn
 	->ops.update = NULL		
 	->ops.cleanup = NULL
 ```
+
+
+# 社区动态
+https://lore.kernel.org/all/20250712195016.151108-1-sj@kernel.org/
+用damon_call替代callback，将任务加到列表中，按照先来后到的数执行，这是否会造成任务优先级的问题。
