@@ -1,3 +1,10 @@
+```bash
+sudo mount -o loop ext4_htree.img /mnt/ext4_htree
+losetup -a
+./ext_tool -m -d /dev/loop19
+```
+
+
 ## def.h
 ```c
 #ifndef _EXT4_TOOL_LIB_H_
