@@ -131,13 +131,16 @@ wb_workfn
 									->TestClearPageDirty(page)
 								->ext4_writepage
 
-//write系统调用
-generic_perform_write
-	->a_ops->write_begin	(ext4_da_write_begin)
-	->iov_iter_copy_from_user_atomic
-	->a_ops->write_end		(ext4_da_write_end)
-		->ext4_da_write_inline_data_end
-			->ext4_write_inline_data_end
-				->SetPageUptodate(page);
-				->ClearPageDirty(page);
+//write系统调用vfs_write
+vfs_write
+    ->file->f_op->write_iter(ext4_file_write_iter)
+        ->ext4_buffered_write_iter
+            ->generic_perform_write
+                ->a_ops->write_begin	(ext4_da_write_begin)
+                ->iov_iter_copy_from_user_atomic
+                ->a_ops->write_end		(ext4_da_write_end)
+                    ->ext4_da_write_inline_data_end
+                        ->ext4_write_inline_data_end
+                            ->SetPageUptodate(page);
+                            ->ClearPageDirty(page);
 ```
