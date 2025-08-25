@@ -1000,3 +1000,111 @@ static inline ssize_t generic_write_sync(struct kiocb *iocb, ssize_t count)
 	return count;
 }
 ```
+
+```c
+
+ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
+{
+	struct file *file = iocb->ki_filp;
+	loff_t pos = iocb->ki_pos;
+	struct address_space *mapping = file->f_mapping;
+	const struct address_space_operations *a_ops = mapping->a_ops;
+	size_t chunk = mapping_max_folio_size(mapping);
+	long status = 0;
+	ssize_t written = 0;
+
+	do {
+		struct folio *folio;
+		size_t offset;		/* Offset into folio */
+		size_t bytes;		/* Bytes to write to folio */
+		size_t copied;		/* Bytes copied from user */
+		void *fsdata = NULL;
+		// offset:为在页面内的偏移
+		// bytes:要从用户空间拷贝的数据大小
+		bytes = iov_iter_count(i);
+retry:
+		offset = pos & (chunk - 1);
+		bytes = min(chunk - offset, bytes);
+		/*调用 balance_dirty_pages_ratelimited() 来检查页面Cache中的脏页比例是否超过一 个阀值(通常为系统中页的40%)。
+		若超过阀值，就调用 writeback_inodes() 来刷新几十页到磁盘上*/
+		balance_dirty_pages_ratelimited(mapping);
+
+		/*
+		 * Bring in the user page that we will copy from _first_.
+		 * Otherwise there's a nasty deadlock on copying from the
+		 * same page as we're writing to, without it being marked
+		 * up-to-date.
+		 */
+		if (unlikely(fault_in_iov_iter_readable(i, bytes) == bytes)) {
+			status = -EFAULT;
+			break;
+		}
+
+		if (fatal_signal_pending(current)) {
+			status = -EINTR;
+			break;
+		}
+		/*调用索引节点(file->f_mapping)中address_space对象的write_begin方法，
+		write_begin方法会为该页分配和初始化缓冲区首部，对于ext4文件系统 使能delay alloc特性的情况下，
+		系统实现的write_begin方法ext4_da_write_begin()	*/
+		status = a_ops->write_begin(file, mapping, pos, bytes,
+						&folio, &fsdata);
+		if (unlikely(status < 0))
+			break;
+
+		offset = offset_in_folio(folio, pos);
+		if (bytes > folio_size(folio) - offset)
+			bytes = folio_size(folio) - offset;
+
+		/*mapping->i_mmap_writable 记录 VM_SHAREE 共享映射数。
+		若mapping_writably_mapped()不等于0，则说明该页面被多个共享使用，调用flush_dcache_page()。
+		flush_dcache_page()将dcache相应的page里的数据写到memory里去，
+		以保证dcache内的数据与memory内的数据的一致性。
+		但在x86架构中，flush_dcache_page() 的实现为空，不做任何操作。*/
+		if (mapping_writably_mapped(mapping))
+			flush_dcache_folio(folio);
+
+		copied = copy_folio_from_iter_atomic(folio, offset, bytes, i);
+		flush_dcache_folio(folio);
+
+		/*将待写的数据拷贝到内核空间后，调用ext4文件系统的address_space_operations的 write_end方法。
+		加载ext4分区时，默认方式为delay allocation。对应的write_end方法为 ext4_da_write_end()。*/
+		status = a_ops->write_end(file, mapping, pos, bytes, copied,
+						folio, fsdata);
+		if (unlikely(status != copied)) {
+			iov_iter_revert(i, copied - max(status, 0L));
+			if (unlikely(status < 0))
+				break;
+		}
+		cond_resched();/*cond_resched()检查当前进程的TIF_NEED_RESCHED标志，若该标志为设置，则调用schedule函数*/
+		
+		/*当a_ops->write_end()执行完成后，写数据操作完成了(注意，此时数据不一定真正写到磁盘上，
+		因为大多数数据写为异步I/O)。接下来就要更新iov_iter结构体里的信息，
+		包括文件的位置、写数据大小、数据所在位置。若copied值为0，
+		说明没能将数据从用户态拷贝到内核态，就要再次尝试写操作。*/
+		if (unlikely(status == 0)) {
+			/*
+			 * A short copy made ->write_end() reject the
+			 * thing entirely.  Might be memory poisoning
+			 * halfway through, might be a race with munmap,
+			 * might be severe memory pressure.
+			 */
+			if (chunk > PAGE_SIZE)
+				chunk /= 2;
+			if (copied) {
+				bytes = copied;
+				goto retry;
+			}
+		} else {//更新文件位置pos和已完成写的数据大小
+			pos += status;
+			written += status;
+		}
+	} while (iov_iter_count(i));
+
+	if (!written)
+		return status;
+	iocb->ki_pos += written;
+	return written;
+}
+
+```
