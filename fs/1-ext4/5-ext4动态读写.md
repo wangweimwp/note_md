@@ -25,6 +25,41 @@
 
 *No Delayed Allocation 与 direct IO区别在于是否经过page cache这一层*
 
+
+## folio 与 buffer head的关系
+
+### 物理结构关系：页面细分与管理
+#### ‌基础单元划分‌
+page是物理内存管理的最小单位（通常4KB），用于缓存文件数据或块设备内容‌
+
+buffer_head则描述page内更细粒度的‌磁盘逻辑块‌（如1KB），一个page可包含多个buffer_head（例如4个1KB块）‌
+
+#### 指针互联机制‌
+page结构体的private字段指向首个buffer_head‌
+
+buffer_head通过b_this_page形成循环链表，并通过b_page反向关联所属page‌
+### 功能映射关系：磁盘与内存的桥梁
+#### 磁盘块定位‌
+buffer_head记录磁盘逻辑块号（b_blocknr）和块大小（b_size），明确page中某段数据对应的磁盘位置‌
+
+#### 状态同步控制‌
+buffer_head跟踪缓冲区的状态（如脏页BH_Dirty、数据有效BH_Uptodate），确保内存与磁盘数据一致性‌
+
+例如写入操作后，buffer_head将page标记为脏，触发回写机制‌
+4。
+### I/O协同关系：与bio的联动
+#### bio的数据载体‌
+page是块设备I/O（bio结构）的实际数据载体：
+读操作时，磁盘数据通过bio写入page；
+写操作时，page数据通过bio写入磁盘‌
+
+#### buffer_head的纽带作用‌
+bio发起I/O前需借助buffer_head：
+检查数据是否已在page缓存中（避免重复读）；
+若需磁盘访问，buffer_head提供磁盘块号生成I/O请求‌
+
+![](./image/37.png)
+
 # ext4_da_write_begin
 ```c
 static int ext4_da_write_begin(struct file *file, struct address_space *mapping,
