@@ -62,6 +62,7 @@ bio发起I/O前需借助buffer_head：
 
 # ext4_da_write_begin
 ```c
+
 static int ext4_da_write_begin(struct file *file, struct address_space *mapping,
 			       loff_t pos, unsigned len,
 			       struct folio **foliop, void **fsdata)
@@ -107,7 +108,7 @@ retry:
 
 	/*获取folio的buffer head，对每个buffer head分别调用ext4_da_get_block_prep*/
 	ret = ext4_block_write_begin(NULL, folio, pos, len,
-				     ext4_da_get_block_prep);
+				     ext4_da_get_block_prep);//下文详解
 	if (ret < 0) {
 		folio_unlock(folio);
 		folio_put(folio);
@@ -128,6 +129,9 @@ retry:
 	*foliop = folio;
 	return ret;
 }
+
+
+
 
 int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 			   loff_t pos, unsigned len,
@@ -156,6 +160,8 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 	if (!head)
 		head = create_empty_buffers(folio, blocksize, 0);
 	bbits = ilog2(blocksize);
+	/* folio->index存放这个folio在这个文件中的偏移量
+	计算得出block在文件中的偏移量*/
 	block = (sector_t)folio->index << (PAGE_SHIFT - bbits);
 
 	for (bh = head, block_start = 0; bh != head || !block_start;
@@ -171,7 +177,7 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 			clear_buffer_new(bh);
 		if (!buffer_mapped(bh)) {//buffer head还没有映射到磁盘
 			WARN_ON(bh->b_size != blocksize);
-			err = get_block(inode, block, bh, 1);
+			err = get_block(inode, block, bh, 1);//ext4_da_get_block_prep 下文详解
 			if (err)
 				break;
 			if (buffer_new(bh)) {//buffer head的操盘映射时新创建的
@@ -239,5 +245,257 @@ int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 	}
 
 	return err;
+}
+
+/*
+ * This is a special get_block_t callback which is used by
+ * ext4_da_write_begin().  It will either return mapped block or
+ * reserve space for a single block.
+ *
+ * For delayed buffer_head we have BH_Mapped, BH_New, BH_Delay set.
+ * We also have b_blocknr = -1 and b_bdev initialized properly
+ *
+ * For unwritten buffer_head we have BH_Mapped, BH_New, BH_Unwritten set.
+ * We also have b_blocknr = physicalblock mapping unwritten extent and b_bdev
+ * initialized properly.
+ */
+int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
+			   struct buffer_head *bh, int create)
+{
+	struct ext4_map_blocks map;
+	sector_t invalid_block = ~((sector_t) 0xffff);
+	int ret = 0;
+
+	BUG_ON(create == 0);
+	BUG_ON(bh->b_size != inode->i_sb->s_blocksize);
+
+	if (invalid_block < ext4_blocks_count(EXT4_SB(inode->i_sb)->s_es))
+		invalid_block = ~0;
+
+	map.m_lblk = iblock;
+	map.m_len = 1;
+
+	/*
+	 * first, we need to know whether the block is allocated already
+	 * preallocated blocks are unmapped but should treated
+	 * the same as allocated blocks.看这个块是否被映射
+	 */
+	ret = ext4_da_map_blocks(inode, &map);//下文详解
+	if (ret < 0)
+		return ret;
+
+	if (map.m_flags & EXT4_MAP_DELAYED) {//extent 延时分配
+		map_bh(bh, inode->i_sb, invalid_block);//bh->b_blocknr存放的是起始物理块，初始化为invalid_block
+		set_buffer_new(bh);
+		set_buffer_delay(bh);
+		return 0;
+	}
+
+	map_bh(bh, inode->i_sb, map.m_pblk);//非extent 延时分配 
+	ext4_update_bh_state(bh, map.m_flags);//根据map.m_flags更新bh->b_state
+
+	if (buffer_unwritten(bh)) {
+		/* A delayed write to unwritten bh should be marked
+		 * new and mapped.  Mapped ensures that we don't do
+		 * get_block multiple times when we write to the same
+		 * offset and new ensures that we do proper zero out
+		 * for partial write.
+		 */
+		set_buffer_new(bh);
+		set_buffer_mapped(bh);
+	}
+	return 0;
+}
+
+/*
+ * Looks up the requested blocks and sets the delalloc extent map.
+ * First try to look up for the extent entry that contains the requested
+ * blocks in the extent status tree without i_data_sem, then try to look
+ * up for the ondisk extent mapping with i_data_sem in read mode,
+ * finally hold i_data_sem in write mode, looks up again and add a
+ * delalloc extent entry if it still couldn't find any extent. Pass out
+ * the mapped extent through @map and return 0 on success.
+查找请求的块并设置延迟分配（delalloc）的区段映射。
+首先尝试在不持有 i_data_sem 的情况下，于区段状态树中查找包含所请求块的区段条目；
+若未找到，则尝试在持有 i_data_sem 读锁的情况下查找磁盘上的区段映射；
+最后，在持有 i_data_sem 写锁的情况下再次查找，若仍未找到任何区段，则添加一个延迟分配区段条目。
+通过 @map 参数输出映射的区段信息，成功时返回 0。
+ */
+static int ext4_da_map_blocks(struct inode *inode, struct ext4_map_blocks *map)
+{
+	struct extent_status es;
+	int retval;
+#ifdef ES_AGGRESSIVE_TEST
+	struct ext4_map_blocks orig_map;
+
+	memcpy(&orig_map, map, sizeof(*map));
+#endif
+
+	map->m_flags = 0;
+	ext_debug(inode, "max_blocks %u, logical block %lu\n", map->m_len,
+		  (unsigned long) map->m_lblk);
+
+	/* Lookup extent status tree firstly */
+	if (ext4_es_lookup_extent(inode, map->m_lblk, NULL, &es)) {
+		map->m_len = min_t(unsigned int, map->m_len,
+				   es.es_len - (map->m_lblk - es.es_lblk));
+
+		if (ext4_es_is_hole(&es))
+			goto add_delayed;
+
+found:
+		/*
+		 * Delayed extent could be allocated by fallocate.
+		 * So we need to check it.
+		 */
+		if (ext4_es_is_delayed(&es)) {
+			map->m_flags |= EXT4_MAP_DELAYED;
+			return 0;
+		}
+
+		map->m_pblk = ext4_es_pblock(&es) + map->m_lblk - es.es_lblk;
+		if (ext4_es_is_written(&es))
+			map->m_flags |= EXT4_MAP_MAPPED;
+		else if (ext4_es_is_unwritten(&es))
+			map->m_flags |= EXT4_MAP_UNWRITTEN;
+		else
+			BUG();
+
+#ifdef ES_AGGRESSIVE_TEST
+		ext4_map_blocks_es_recheck(NULL, inode, map, &orig_map, 0);
+#endif
+		return 0;
+	}
+
+	/*
+	 * Try to see if we can get the block without requesting a new
+	 * file system block.
+	 */
+	down_read(&EXT4_I(inode)->i_data_sem);
+	if (ext4_has_inline_data(inode))
+		retval = 0;
+	else
+		retval = ext4_map_query_blocks(NULL, inode, map);
+	up_read(&EXT4_I(inode)->i_data_sem);
+	if (retval)
+		return retval < 0 ? retval : 0;
+
+add_delayed:
+	down_write(&EXT4_I(inode)->i_data_sem);
+	/*
+	 * Page fault path (ext4_page_mkwrite does not take i_rwsem)
+	 * and fallocate path (no folio lock) can race. Make sure we
+	 * lookup the extent status tree here again while i_data_sem
+	 * is held in write mode, before inserting a new da entry in
+	 * the extent status tree.
+	 */
+	if (ext4_es_lookup_extent(inode, map->m_lblk, NULL, &es)) {
+		map->m_len = min_t(unsigned int, map->m_len,
+				   es.es_len - (map->m_lblk - es.es_lblk));
+
+		if (!ext4_es_is_hole(&es)) {
+			up_write(&EXT4_I(inode)->i_data_sem);
+			goto found;
+		}
+	} else if (!ext4_has_inline_data(inode)) {
+		retval = ext4_map_query_blocks(NULL, inode, map);
+		if (retval) {
+			up_write(&EXT4_I(inode)->i_data_sem);
+			return retval < 0 ? retval : 0;
+		}
+	}
+
+	map->m_flags |= EXT4_MAP_DELAYED;
+	retval = ext4_insert_delayed_blocks(inode, map->m_lblk, map->m_len);
+	up_write(&EXT4_I(inode)->i_data_sem);
+
+	return retval;
+}
+```
+
+从代码逻辑看ext4_block_write_begin作用是
+1，初始化buffer head，建立buffer head和folio对应关系
+2，查询或分配磁盘block，建立与buffer head映射关系
+3，记录日志
+
+接下看block的查找过程
+
+```c
+/*
+ * ext4_es_lookup_extent() looks up an extent in extent status tree.
+ *
+ * ext4_es_lookup_extent is called by ext4_map_blocks/ext4_da_map_blocks.
+ *
+ * Return: 1 on found, 0 on not
+ */
+int ext4_es_lookup_extent(struct inode *inode, ext4_lblk_t lblk,
+			  ext4_lblk_t *next_lblk,
+			  struct extent_status *es)
+{
+	struct ext4_es_tree *tree;
+	struct ext4_es_stats *stats;
+	struct extent_status *es1 = NULL;
+	struct rb_node *node;
+	int found = 0;
+
+	if (EXT4_SB(inode->i_sb)->s_mount_state & EXT4_FC_REPLAY)//进行日志回溯？
+		return 0;
+
+	trace_ext4_es_lookup_extent_enter(inode, lblk);
+	es_debug("lookup extent in block %u\n", lblk);
+
+	tree = &EXT4_I(inode)->i_es_tree;
+	read_lock(&EXT4_I(inode)->i_es_lock);
+
+	/* find extent in cache firstly */
+	es->es_lblk = es->es_len = es->es_pblk = 0;
+	es1 = READ_ONCE(tree->cache_es);
+	if (es1 && in_range(lblk, es1->es_lblk, es1->es_len)) {
+		es_debug("%u cached by [%u/%u)\n",
+			 lblk, es1->es_lblk, es1->es_len);
+		found = 1;
+		goto out;
+	}
+
+	node = tree->root.rb_node;
+	while (node) {//循环查询红黑树，找到与lblk相等的block
+		es1 = rb_entry(node, struct extent_status, rb_node);
+		if (lblk < es1->es_lblk)
+			node = node->rb_left;
+		else if (lblk > ext4_es_end(es1))
+			node = node->rb_right;
+		else {
+			found = 1;
+			break;
+		}
+	}
+
+out:
+	stats = &EXT4_SB(inode->i_sb)->s_es_stats;
+	if (found) {
+		BUG_ON(!es1);
+		es->es_lblk = es1->es_lblk;
+		es->es_len = es1->es_len;
+		es->es_pblk = es1->es_pblk;
+		if (!ext4_es_is_referenced(es1))
+			ext4_es_set_referenced(es1);
+		percpu_counter_inc(&stats->es_stats_cache_hits);//增加extent_status命中计数
+		if (next_lblk) {
+			node = rb_next(&es1->rb_node);
+			if (node) {
+				es1 = rb_entry(node, struct extent_status,
+					       rb_node);
+				*next_lblk = es1->es_lblk;
+			} else
+				*next_lblk = 0;
+		}
+	} else {
+		percpu_counter_inc(&stats->es_stats_cache_misses);//增加extent_status miss计数
+	}
+
+	read_unlock(&EXT4_I(inode)->i_es_lock);
+
+	trace_ext4_es_lookup_extent_exit(inode, es, found);
+	return found;
 }
 ```
