@@ -61,6 +61,23 @@ bio发起I/O前需借助buffer_head：
 ![](./image/37.png)
 
 # ext4_da_write_begin
+
+```c
+
+ext4_da_write_begin
+	->__filemap_get_folio	//获取写数据的page cache
+	->ext4_block_write_begin	/*获取folio的buffer head，对每个buffer head分别调用ext4_da_get_block_prep*/
+		->ext4_da_get_block_prep	//返回新建的block或者为单个块预留空间
+			->ext4_da_map_blocks	//先在inode缓存(ext4_inode_info->i_es_tree)中查找请求的块,若没有则在磁盘中查找或新建
+				->ext4_es_lookup_extent	//在inode缓存(ext4_inode_info->i_es_tree)中查找
+				->ext4_map_query_blocks	//black 申请/映射/预申请过程
+					->ext4_ext_map_blocks	//遍历extent层级
+						->ext4_find_extent	
+							->ext4_ext_binsearch_idx	//通过ext4_extent_idx拿掉下一层ext4_extent_idx
+							->read_extent_tree_block	//从磁盘中读取下一层ext4_extent_idx所在的block
+							->ext4_ext_binsearch		//最终获取到ext4_extent 
+```
+
 ```c
 
 static int ext4_da_write_begin(struct file *file, struct address_space *mapping,

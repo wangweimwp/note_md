@@ -140,7 +140,7 @@ struct commit_header {
 
 看到了超级块和第一个描述块，由于第一个描述块的h_sequence值是2，而first Commit id expected in log是5，所以这个描述块是无用的
 
-记下来看物理块31
+接下来看物理块31
 ![](./image/32.png)
 看到了h_sequence值为5的描述块，与first Commit id expected in log解析一致，所以后边的所有描述块都有效，继续解析有序描述块
 ![](./image/33.png)
