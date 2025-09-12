@@ -1,7 +1,45 @@
 
 ```c
-//black 申请/映射/预申请过程
 
+
+/*black 申请/映射/预申请过程
+ext4_ext_map_blocks()函数主要流程有如下几点：
+
+1：先执行ext4_ext_find_extent()，试图找到逻辑块地址最接近map->m_lblk的
+索引节点ext4_extent_idr结构和叶子节点ext4_extent结构并保存到path[]。
+ext4_ext_find_extent()函数源码下文详解。如果找到匹配的叶子节点ext4_extent结构，
+则ex = path[depth].p_ext保存这个找到的ext4_extent结构。此时if (ex)成立，
+如果map->m_lblk在ex的逻辑块地址范围内，即if (in_range(map->m_lblk, ee_block, ee_len))成立，
+则执行里边代码newblock = map->m_lblk - ee_block + ee_start和
+allocated = ee_len - (map->m_lblk - ee_block)，
+通过ex已经映射的逻辑块地址和物理块地址找到map->m_lblk映射的起始物理块，
+allocated是找到的映射的物理块个数。简单说，
+本次要映射的起始逻辑块地址map->m_lblk在ex的逻辑块地址范围内，
+那就可以借助ex这个ext4_extent已有的逻辑块地址与物理块地址映射关系，
+找到map->m_lblk映射的起始物理块地址，并找到已经映射过的allocated个物理块。
+
+2：如果ex是已初始化状态，则if (!ext4_ext_is_uninitialized(ex))成立，
+直接goto out 。否则ex未初始化状态，
+则要执行ext4_ext_handle_uninitialized_extents()->ext4_ext_convert_to_initialized()
+对ex的逻辑块地址进行分割，还有概率创建新的索引节点和叶子节点。
+高版本内核 ext4_ext_handle_uninitialized_extents()函数名称改为 ext4_ext_handle_unwritten_extents()，
+需注意，ext4_ext_convert_to_initialized()源码下文详解。
+
+3：继续ext4_ext_map_blocks()代码，如果ex = path[depth].p_ext是NULL，则if (ex)不成立。
+则执行下文newblock = ext4_mb_new_blocks(handle, &ar, &err)函数，
+针对本次需映射的起始逻辑块地址map->m_lblk和需映射的逻辑块个数map->m_len，
+分配map->m_len个连续的物理块并返回这map->m_len个物理块的第一个物理块号给newblock。
+
+4：接着先执行newex.ee_block = cpu_to_le32(map->m_lblk)赋值本次要映射的起始逻辑块地址，
+newex是针对本次逻辑块地址映射创建的ext4_extent结构。
+然后执行ext4_ext_store_pblock(&newex, newblock + offset)
+把本次逻辑块地址map->m_lblk ~( map->m_lblk+ map->m_len)
+映射的起始物理块号newblock保存到newex的ee_start_lo和ee_start_hi。
+并执行newex.ee_len = cpu_to_le16(ar.len)把成功映射的物理块数保存到newex.ee_len，即map->m_len。
+
+5：执行err = ext4_ext_insert_extent(handle, inode, path,&newex, flags)
+把代表本次逻辑块地址映射关系的newex插入到ext4  extent b+树。
+*/
 /*
  * Block allocation/map/preallocation routine for extents based files
  *
@@ -188,7 +226,7 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 
 	/* allocate new block */
 	ar.inode = inode;
-	ar.goal = ext4_ext_find_goal(inode, path, map->m_lblk);
+	ar.goal = ext4_ext_find_goal(inode, path, map->m_lblk);//找到map->m_lblk映射的目标起始物理块地址并返回给ar.goal
 	ar.logical = map->m_lblk;
 	/*
 	 * We calculate the offset from the beginning of the cluster
@@ -213,6 +251,11 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 		ar.flags |= EXT4_MB_DELALLOC_RESERVED;
 	if (flags & EXT4_GET_BLOCKS_METADATA_NOFAIL)
 		ar.flags |= EXT4_MB_USE_RESERVED;
+	/*分配map->m_len个物理块，这就是newex逻辑块地址映射的map->m_len个物理块，
+	并返回这map->m_len个物理块的起始物理块号newblock。测试结果 newblock 
+	和 ar.goal有时相等，有时不相等。本次映射的起始逻辑块地址是map->m_lblk，
+	映射物理块个数map->m_len，ext4_mb_new_blocks()除了要找到newblock这个起始逻辑块地址，
+	还得保证找到newblock打头的连续map->m_len个物理块，必须是连续的，这才是更重要的。*/
 	newblock = ext4_mb_new_blocks(handle, &ar, &err);
 	if (!newblock)
 		goto out;
@@ -226,15 +269,15 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 got_allocated_blocks:
 	/* try to insert new extent into found leaf and return */
 	pblk = newblock + offset;
-	ext4_ext_store_pblock(&newex, pblk);
-	newex.ee_len = cpu_to_le16(ar.len);
+	ext4_ext_store_pblock(&newex, pblk); /*设置本次映射的map->m_len个物理块的起始物理块号(newblock)到newex，newex是针对本次映射分配的ext4_extent结构*/
+	newex.ee_len = cpu_to_le16(ar.len);/*设置newex映射的物理块个数，与执行ext4_ext_mark_initialized()标记ex已初始化一个效果*/
 	/* Mark unwritten */
 	if (flags & EXT4_GET_BLOCKS_UNWRIT_EXT) {
 		ext4_ext_mark_unwritten(&newex);
 		map->m_flags |= EXT4_MAP_UNWRITTEN;
 	}
 
-	path = ext4_ext_insert_extent(handle, inode, path, &newex, flags);
+	path = ext4_ext_insert_extent(handle, inode, path, &newex, flags);//把newex这个插入ext4 extent B+树
 	if (IS_ERR(path)) {
 		err = PTR_ERR(path);
 		if (allocated_clusters) {
@@ -266,7 +309,7 @@ got_allocated_blocks:
 
 	map->m_flags |= (EXT4_MAP_NEW | EXT4_MAP_MAPPED);
 	map->m_pblk = pblk;
-	map->m_len = ar.len;
+	map->m_len = ar.len; /*本次逻辑块地址完成映射的物理块数，并不能保证allocated等于传入的map->m_len，还有可能小于*/
 	allocated = map->m_len;
 	ext4_ext_show_leaf(inode, path);
 out:
