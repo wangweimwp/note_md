@@ -407,4 +407,267 @@ err:
 	ext4_free_ext_path(path);
 	return ERR_PTR(ret);
 }
+
+
+
+
+
+
+
+/*
+ * This function is called by ext4_ext_map_blocks() if someone tries to write
+ * to an unwritten extent. It may result in splitting the unwritten
+ * extent into multiple extents (up to three - one initialized and two
+ * unwritten).
+ * There are three possibilities:
+ *   a> There is no split required: Entire extent should be initialized
+ *   b> Splits in two extents: Write is happening at either end of the extent
+ *   c> Splits in three extents: Somone is writing in middle of the extent
+ *
+ * Pre-conditions:
+ *  - The extent pointed to by 'path' is unwritten.
+ *  - The extent pointed to by 'path' contains a superset
+ *    of the logical span [map->m_lblk, map->m_lblk + map->m_len).
+ *
+ * Post-conditions on success:
+ *  - the returned value is the number of blocks beyond map->l_lblk
+ *    that are allocated and initialized.
+ *    It is guaranteed to be >= map->m_len.
+ */
+static struct ext4_ext_path *
+ext4_ext_convert_to_initialized(handle_t *handle, struct inode *inode,
+			struct ext4_map_blocks *map, struct ext4_ext_path *path,
+			int flags, unsigned int *allocated)
+{
+	struct ext4_sb_info *sbi;
+	struct ext4_extent_header *eh;
+	struct ext4_map_blocks split_map;
+	struct ext4_extent zero_ex1, zero_ex2;
+	struct ext4_extent *ex, *abut_ex;
+	ext4_lblk_t ee_block, eof_block;
+	unsigned int ee_len, depth, map_len = map->m_len;
+	int err = 0;
+	int split_flag = EXT4_EXT_DATA_VALID2;
+	unsigned int max_zeroout = 0;
+
+	ext_debug(inode, "logical block %llu, max_blocks %u\n",
+		  (unsigned long long)map->m_lblk, map_len);
+
+	sbi = EXT4_SB(inode->i_sb);
+	eof_block = (EXT4_I(inode)->i_disksize + inode->i_sb->s_blocksize - 1)
+			>> inode->i_sb->s_blocksize_bits;//文件的大小
+	if (eof_block < map->m_lblk + map_len)//文件有变大
+		eof_block = map->m_lblk + map_len;
+
+	depth = ext_depth(inode);
+	eh = path[depth].p_hdr;
+	ex = path[depth].p_ext;
+	ee_block = le32_to_cpu(ex->ee_block);
+	ee_len = ext4_ext_get_actual_len(ex);
+	zero_ex1.ee_len = 0;
+	zero_ex2.ee_len = 0;
+
+	trace_ext4_ext_convert_to_initialized_enter(inode, map, ex);
+
+	/* Pre-conditions */
+	BUG_ON(!ext4_ext_is_unwritten(ex));
+	BUG_ON(!in_range(map->m_lblk, ee_block, ee_len));
+
+	/*
+	 * Attempt to transfer newly initialized blocks from the currently
+	 * unwritten extent to its neighbor. This is much cheaper
+	 * than an insertion followed by a merge as those involve costly
+	 * memmove() calls. Transferring to the left is the common case in
+	 * steady state for workloads doing fallocate(FALLOC_FL_KEEP_SIZE)
+	 * followed by append writes.
+	 *
+	 * Limitations of the current logic:
+	 *  - L1: we do not deal with writes covering the whole extent.
+	 *    This would require removing the extent if the transfer
+	 *    is possible.
+	 *  - L2: we only attempt to merge with an extent stored in the
+	 *    same extent tree node.
+	 */
+	*allocated = 0;
+	if ((map->m_lblk == ee_block) &&//本次映射的起始逻辑块等于找到的extern的起始逻辑块
+		/* See if we can merge left */
+		(map_len < ee_len) &&		/*L1*/ //本次映射的长度小于找到的extern的长度
+		(ex > EXT_FIRST_EXTENT(eh))) {	/*L2*///不是第一个extern
+		ext4_lblk_t prev_lblk;
+		ext4_fsblk_t prev_pblk, ee_pblk;
+		unsigned int prev_len;
+
+		abut_ex = ex - 1;//当前extern的前一个extern
+		prev_lblk = le32_to_cpu(abut_ex->ee_block);
+		prev_len = ext4_ext_get_actual_len(abut_ex);
+		prev_pblk = ext4_ext_pblock(abut_ex);
+		ee_pblk = ext4_ext_pblock(ex);
+
+		/*
+		 * A transfer of blocks from 'ex' to 'abut_ex' is allowed
+		 * upon those conditions:可以与前一个extent合并的条件
+		 * - C1: abut_ex is initialized, 前一个extent是初始化过的
+		 * - C2: abut_ex is logically abutting ex,  逻辑块相邻
+		 * - C3: abut_ex is physically abutting ex, 物理块相邻
+		 * - C4: abut_ex can receive the additional blocks without合并后长度不会超过限度
+		 *   overflowing the (initialized) length limit.
+		 */
+		if ((!ext4_ext_is_unwritten(abut_ex)) &&		/*C1*/
+			((prev_lblk + prev_len) == ee_block) &&		/*C2*/
+			((prev_pblk + prev_len) == ee_pblk) &&		/*C3*/
+			(prev_len < (EXT_INIT_MAX_LEN - map_len))) {	/*C4*/
+			err = ext4_ext_get_access(handle, inode, path + depth);
+			if (err)
+				goto errout;
+
+			trace_ext4_ext_convert_to_initialized_fastpath(inode,
+				map, ex, abut_ex);
+
+			/* Shift the start of ex by 'map_len' blocks */
+			ex->ee_block = cpu_to_le32(ee_block + map_len);
+			ext4_ext_store_pblock(ex, ee_pblk + map_len);
+			ex->ee_len = cpu_to_le16(ee_len - map_len);
+			ext4_ext_mark_unwritten(ex); /* Restore the flag */
+
+			/* Extend abut_ex by 'map_len' blocks */
+			abut_ex->ee_len = cpu_to_le16(prev_len + map_len);
+
+			/* Result: number of initialized blocks past m_lblk */
+			*allocated = map_len;//申请到map_len个block
+		}
+	} else if (((map->m_lblk + map_len) == (ee_block + ee_len)) &&//本次映射的结束逻辑块等于找到的extern的结束逻辑块
+		   (map_len < ee_len) &&	/*L1*///本次映射的长度小于找到的extern的长度
+		   ex < EXT_LAST_EXTENT(eh)) {	/*L2*///不是最后一个extern
+		/* See if we can merge right */
+		ext4_lblk_t next_lblk;
+		ext4_fsblk_t next_pblk, ee_pblk;
+		unsigned int next_len;
+
+		abut_ex = ex + 1;//当前extern的下一个extern
+		next_lblk = le32_to_cpu(abut_ex->ee_block);
+		next_len = ext4_ext_get_actual_len(abut_ex);
+		next_pblk = ext4_ext_pblock(abut_ex);
+		ee_pblk = ext4_ext_pblock(ex);
+
+		/*
+		 * A transfer of blocks from 'ex' to 'abut_ex' is allowed
+		 * upon those conditions:可以与下一个extent合并的条件
+		 * - C1: abut_ex is initialized, 下一个extent是初始化过的
+		 * - C2: abut_ex is logically abutting ex,逻辑块相邻
+		 * - C3: abut_ex is physically abutting ex,物理块相邻
+		 * - C4: abut_ex can receive the additional blocks without合并后长度不会超过限度
+		 *   overflowing the (initialized) length limit.
+		 */
+		if ((!ext4_ext_is_unwritten(abut_ex)) &&		/*C1*/
+		    ((map->m_lblk + map_len) == next_lblk) &&		/*C2*/
+		    ((ee_pblk + ee_len) == next_pblk) &&		/*C3*/
+		    (next_len < (EXT_INIT_MAX_LEN - map_len))) {	/*C4*/
+			err = ext4_ext_get_access(handle, inode, path + depth);
+			if (err)
+				goto errout;
+
+			trace_ext4_ext_convert_to_initialized_fastpath(inode,
+				map, ex, abut_ex);
+
+			/* Shift the start of abut_ex by 'map_len' blocks */
+			abut_ex->ee_block = cpu_to_le32(next_lblk - map_len);
+			ext4_ext_store_pblock(abut_ex, next_pblk - map_len);
+			ex->ee_len = cpu_to_le16(ee_len - map_len);
+			ext4_ext_mark_unwritten(ex); /* Restore the flag */
+
+			/* Extend abut_ex by 'map_len' blocks */
+			abut_ex->ee_len = cpu_to_le16(next_len + map_len);
+
+			/* Result: number of initialized blocks past m_lblk */
+			*allocated = map_len;//申请到map_len个block
+		}
+	}
+	if (*allocated) {
+		/* Mark the block containing both extents as dirty */
+		err = ext4_ext_dirty(handle, inode, path + depth);
+
+		/* Update path to point to the right extent */
+		path[depth].p_ext = abut_ex;//指向将要被合并的extent
+		if (err)
+			goto errout;
+		goto out;
+	} else
+		*allocated = ee_len - (map->m_lblk - ee_block);//上边两个合并条件不成立，能申请到的block不会跨越当前extent
+
+	WARN_ON(map->m_lblk < ee_block);
+	/*
+	 * It is safe to convert extent to initialized via explicit
+	 * zeroout only if extent is fully inside i_size or new_size.
+	 */
+	split_flag |= ee_block + ee_len <= eof_block ? EXT4_EXT_MAY_ZEROOUT : 0;
+
+	if (EXT4_EXT_MAY_ZEROOUT & split_flag)
+		max_zeroout = sbi->s_extent_max_zeroout_kb >>
+			(inode->i_sb->s_blocksize_bits - 10);
+
+	/*
+	 * five cases:
+	 * 1. split the extent into three extents.
+	 * 2. split the extent into two extents, zeroout the head of the first
+	 *    extent.
+	 * 3. split the extent into two extents, zeroout the tail of the second
+	 *    extent.
+	 * 4. split the extent into two extents with out zeroout.
+	 * 5. no splitting needed, just possibly zeroout the head and / or the
+	 *    tail of the extent.
+	 */
+	split_map.m_lblk = map->m_lblk;
+	split_map.m_len = map->m_len;
+
+	if (max_zeroout && (*allocated > split_map.m_len)) {//申请到的block大于本次需要的block
+		if (*allocated <= max_zeroout) {//申请到的block小于最大清零block数
+			/* case 3 or 5 *///尾部的extent需要清零
+			zero_ex1.ee_block =
+				 cpu_to_le32(split_map.m_lblk +
+					     split_map.m_len);
+			zero_ex1.ee_len =
+				cpu_to_le16(*allocated - split_map.m_len);
+			ext4_ext_store_pblock(&zero_ex1,
+				ext4_ext_pblock(ex) + split_map.m_lblk +
+				split_map.m_len - ee_block);
+			err = ext4_ext_zeroout(inode, &zero_ex1);
+			if (err)
+				goto fallback;
+			split_map.m_len = *allocated;
+		}
+		if (split_map.m_lblk - ee_block + split_map.m_len <
+								max_zeroout) {
+			/* case 2 or 5 *///头部的extent需要清零
+			if (split_map.m_lblk != ee_block) {//需求起始逻辑块大于找到的extern起始逻辑块
+				zero_ex2.ee_block = ex->ee_block;
+				zero_ex2.ee_len = cpu_to_le16(split_map.m_lblk -
+							ee_block);
+				ext4_ext_store_pblock(&zero_ex2,
+						      ext4_ext_pblock(ex));
+				err = ext4_ext_zeroout(inode, &zero_ex2);
+				if (err)
+					goto fallback;
+			}
+
+			split_map.m_len += split_map.m_lblk - ee_block;//split_map的长度加上ee_block到map->m_lblk的部分
+			split_map.m_lblk = ee_block;//split_map的起始block等于找到的externt起始逻辑块
+			*allocated = map->m_len;//申请到的block数量赋值为需要的block数
+		}
+	}
+
+fallback:
+	path = ext4_split_extent(handle, inode, path, &split_map, split_flag,
+				 flags, NULL);
+	if (IS_ERR(path))
+		return path;
+out:
+	/* If we have gotten a failure, don't zero out status tree */
+	ext4_zeroout_es(inode, &zero_ex1);
+	ext4_zeroout_es(inode, &zero_ex2);
+	return path;
+
+errout:
+	ext4_free_ext_path(path);
+	return ERR_PTR(err);
+}
 ```
