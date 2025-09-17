@@ -1,6 +1,14 @@
 
 ```c
-
+ext4_ext_map_blocks
+	->ext4_find_extent//找到一个合适的extern叶子节点
+	->ext4_ext_handle_unwritten_extents//找到了合适的extern节点，需要进行分割
+		->ext4_ext_convert_to_initialized//找到的extern节点可能不会恰好符合需求的block数，需要分割、合并、清零等操作
+			->//执行合并、清零等操作
+			->ext4_split_extent//执行分割操作
+	->ext4_ext_determine_insert_hole
+	->ext4_mb_new_blocks//没有找到合适的extern节点，新建extern
+	->ext4_ext_insert_extent//把新申请的extent 插入B+树
 
 /*black 申请/映射/预申请过程
 ext4_ext_map_blocks()函数主要流程有如下几点：
