@@ -6,6 +6,8 @@ ext4_ext_map_blocks
 		->ext4_ext_convert_to_initialized//找到的extern节点可能不会恰好符合需求的block数，需要分割、合并、清零等操作
 			->//执行合并、清零等操作
 			->ext4_split_extent//执行分割操作
+				->ext4_split_extent_at//将extern分割为2段
+				->ext4_find_extent//分割后，更新路径
 	->ext4_ext_determine_insert_hole
 	->ext4_mb_new_blocks//没有找到合适的extern节点，新建extern
 	->ext4_ext_insert_extent//把新申请的extent 插入B+树
@@ -422,7 +424,16 @@ err:
 
 
 
-/*
+/*如果本次要映射的物理块数(或者逻辑块数)map->len小于ex已经映射的逻辑块数ee_len，
+则尝试把ex的map->len的逻辑块合并到它前边或者后边的ext4_extent结构(即abut_ex)。
+合并条件苛刻，需要二者逻辑块地址和物理块地址紧挨着等等。
+如果合并成功直接从ext4_ext_convert_to_initialized()函数返回。
+否则执行ext4_split_extent()把ex的逻辑块地址进程分割成2段或者3段，
+分割出的以map->m_lblk为起始地址且共allocated个逻辑块的逻辑块范围就是我们需要的，
+这allocated个逻辑块可以保证映射了物理块。但allocated<=map->len，
+即并不能保证map要求映射的map->len个逻辑块全映射完成。注意，ext4_split_extent()对ex分割后，
+还剩下其他1~2段逻辑块范围，则要把它们对应的ext4_extent结构插入的ext4_extent B+树。
+
  * This function is called by ext4_ext_map_blocks() if someone tries to write
  * to an unwritten extent. It may result in splitting the unwritten
  * extent into multiple extents (up to three - one initialized and two
@@ -678,4 +689,568 @@ errout:
 	ext4_free_ext_path(path);
 	return ERR_PTR(err);
 }
+
+
+/*
+1 ：map->m_lblk +map->m_len 小于ee_block + ee_len时的分割
+如果 map->m_lblk +map->m_len 小于ee_block + ee_len，
+即map的结束逻辑块地址小于ex的结束逻辑块地址。
+则把ex的逻辑块范围分割成3段ee_block~map->m_lblk 和 
+map->m_lblk~(map->m_lblk +map->m_len) 和 (map->m_lblk +map->m_len)~(ee_block + ee_len)。
+这种情况，就能保证本次要求映射的map->m_len个逻辑块都能完成映射，
+即allocated =map->m_len。具体细节是:
+
+a：if (map->m_lblk + map->m_len < ee_block + ee_len)成立，
+split_flag1 |= EXT4_EXT_MARK_UNINIT1|EXT4_EXT_MARK_UNINIT2,
+然后执行ext4_split_extent_at()以map->m_lblk + map->m_len这个逻辑块地址为分割点，
+把path[depth].p_ext指向的ext4_extent结构(即ex)的逻辑块范围ee_block~(ee_block+ee_len)
+分割成ee_block~(map->m_lblk + map->m_len)和(map->m_lblk + map->m_len)~(ee_block+ee_len)这两个ext4_extent。
+
+b：前半段的ext4_extent还是ex，
+只是映射的逻辑块个数减少了(ee_block+ee_len)-(map->m_lblk + map->m_len)。
+后半段的是个新的ext4_extent。因为split_flag1 |= EXT4_EXT_MARK_UNINIT1|EXT4_EXT_MARK_UNINIT2，
+则还要标记这两个ext4_extent结构"都是未初始化状态"。
+然后把后半段 (map->m_lblk + map->m_len)~(ee_block+ee_len)
+对应的ext4_extent结构添加到ext4 extent B+树。回到ext4_split_extent()函数，
+ext4_ext_find_extent(inode, map->m_lblk, path)后path[depth].p_ext大概率还是老的ex。
+
+c： if (map->m_lblk >= ee_block)肯定成立，
+里边的if (uninitialized)成立，if (uninitialized)里边的
+split_flag1 |= EXT4_EXT_MARK_UNINIT1，可能不会加上EXT4_EXT_MARK_UNINIT2标记。
+因为split_flag1 |= split_flag & (EXT4_EXT_MAY_ZEROOUT |EXT4_EXT_MARK_UNINIT2)，
+接着再次执行ext4_split_extent_at(),以map->m_lblk这个逻辑块地址为分割点，
+把path[depth].p_ext指向的ext4_extent结构(即ex)的逻辑块范围ee_block~(ee_block+ee_len)
+分割成ee_block~map->m_lblk和map->m_lblk~(ee_block+ee_len)两个ext4_extent结构。
+
+前半段的ext4_extent结构还是ex，
+但是逻辑块数减少了(ee_block+ee_len)-map->m_lblk个。
+因为此时split_flag1有EXT4_EXT_MARK_UNINIT1标记，
+可能没有EXT4_EXT_MARK_UNINIT2标记，则再对ex加上"未初始化状态"，
+后半段的ext4_extent可能会被去掉"未初始化状态"，
+因为split_flag1可能没有EXT4_EXT_MARK_UNINIT2标记。接着，
+把后半段的ext4_extent结构添加到ext4 extent B+树。这里有个特例，
+就是 if (map->m_lblk >= ee_block)里的map->m_lblk == ee_block，
+即map的要映射的起始逻辑块地址等于ex的起始逻辑块地址，
+则执行ext4_split_extent_at()函数时，不会再分割ex，里边if (split == ee_block)成立，
+会执行ext4_ext_mark_initialized(ex)标记ex是"初始化状态"，ex终于转正了。
+
+2： map->m_lblk +map->m_len 大于等于ee_block + ee_len时的分割
+如果 map->m_lblk +map->m_len 大于等于ee_block + ee_len，
+即map的结束逻辑块地址大于ex的结束逻辑块地址。
+则把ex的逻辑块范围分割成2段ee_block~map->m_lblk 和 map->m_lblk~(ee_block + ee_len)，
+这种情况，不能保证本次要求映射的map->m_len个逻辑块都完成映射。
+只能映射 (ee_block + ee_len) - map->m_lblk个逻辑块，
+即allocated =(ee_block + ee_len) - map->m_lblk。
+
+ * ext4_split_extent() splits an extent and mark extent which is covered
+ * by @map as split_flags indicates
+ *
+ * It may result in splitting the extent into multiple extents (up to three)
+ * There are three possibilities:
+ *   a> There is no split required
+ *   b> Splits in two extents: Split is happening at either end of the extent
+ *   c> Splits in three extents: Somone is splitting in middle of the extent
+ *
+ */
+static struct ext4_ext_path *ext4_split_extent(handle_t *handle,
+					       struct inode *inode,
+					       struct ext4_ext_path *path,
+					       struct ext4_map_blocks *map,
+					       int split_flag, int flags,
+					       unsigned int *allocated)
+{
+	ext4_lblk_t ee_block;
+	struct ext4_extent *ex;
+	unsigned int ee_len, depth;
+	int unwritten;
+	int split_flag1, flags1;
+
+	depth = ext_depth(inode);
+	ex = path[depth].p_ext;
+	ee_block = le32_to_cpu(ex->ee_block);
+	ee_len = ext4_ext_get_actual_len(ex);
+	unwritten = ext4_ext_is_unwritten(ex);
+
+	if (map->m_lblk + map->m_len < ee_block + ee_len) {//将尾部分割出来
+		split_flag1 = split_flag & EXT4_EXT_MAY_ZEROOUT;
+		flags1 = flags | EXT4_GET_BLOCKS_PRE_IO;
+		if (unwritten)
+			split_flag1 |= EXT4_EXT_MARK_UNWRIT1 |
+				       EXT4_EXT_MARK_UNWRIT2;
+		if (split_flag & EXT4_EXT_DATA_VALID2)
+			split_flag1 |= EXT4_EXT_DATA_VALID1;
+		path = ext4_split_extent_at(handle, inode, path,
+				map->m_lblk + map->m_len, split_flag1, flags1);
+		if (IS_ERR(path))
+			return path;
+		/*
+		 * Update path is required because previous ext4_split_extent_at
+		 * may result in split of original leaf or extent zeroout.
+		 需要更新路径，因为先前的ext4_split_extent_at操作可能导致原始叶节点或区段清零的分割。
+		 */
+		path = ext4_find_extent(inode, map->m_lblk, path, flags);
+		if (IS_ERR(path))
+			return path;
+		depth = ext_depth(inode);
+		ex = path[depth].p_ext;
+		if (!ex) {
+			EXT4_ERROR_INODE(inode, "unexpected hole at %lu",
+					(unsigned long) map->m_lblk);
+			ext4_free_ext_path(path);
+			return ERR_PTR(-EFSCORRUPTED);
+		}
+		unwritten = ext4_ext_is_unwritten(ex);
+	}
+
+	if (map->m_lblk >= ee_block) {//将头部分割出来
+		split_flag1 = split_flag & EXT4_EXT_DATA_VALID2;
+		if (unwritten) {
+			split_flag1 |= EXT4_EXT_MARK_UNWRIT1;
+			split_flag1 |= split_flag & (EXT4_EXT_MAY_ZEROOUT |
+						     EXT4_EXT_MARK_UNWRIT2);
+		}
+		path = ext4_split_extent_at(handle, inode, path,
+				map->m_lblk, split_flag1, flags);
+		if (IS_ERR(path))
+			return path;
+	}
+
+	if (allocated) {
+		if (map->m_lblk + map->m_len > ee_block + ee_len)
+			*allocated = ee_len - (map->m_lblk - ee_block);
+		else
+			*allocated = map->m_len;
+	}
+	ext4_ext_show_leaf(inode, path);
+	return path;
+}
+
+
+/*
+ * ext4_split_extent_at() splits an extent at given block.
+ *
+ * @handle: the journal handle
+ * @inode: the file inode
+ * @path: the path to the extent
+ * @split: the logical block where the extent is splitted.
+ * @split_flags: indicates if the extent could be zeroout if split fails, and
+ *		 the states(init or unwritten) of new extents.
+ * @flags: flags used to insert new extent to extent tree.
+ *
+ *
+ * Splits extent [a, b] into two extents [a, @split) and [@split, b], states
+ * of which are determined by split_flag.
+ *
+ * There are two cases:
+ *  a> the extent are splitted into two extent.
+ *  b> split is not needed, and just mark the extent.
+ *
+ * Return an extent path pointer on success, or an error pointer on failure.
+ */
+static struct ext4_ext_path *ext4_split_extent_at(handle_t *handle,
+						  struct inode *inode,
+						  struct ext4_ext_path *path,
+						  ext4_lblk_t split,
+						  int split_flag, int flags)
+{
+	ext4_fsblk_t newblock;
+	ext4_lblk_t ee_block;
+	struct ext4_extent *ex, newex, orig_ex, zero_ex;
+	struct ext4_extent *ex2 = NULL;
+	unsigned int ee_len, depth;
+	int err = 0;
+
+	BUG_ON((split_flag & (EXT4_EXT_DATA_VALID1 | EXT4_EXT_DATA_VALID2)) ==
+	       (EXT4_EXT_DATA_VALID1 | EXT4_EXT_DATA_VALID2));
+
+	ext_debug(inode, "logical block %llu\n", (unsigned long long)split);
+
+	ext4_ext_show_leaf(inode, path);
+
+	depth = ext_depth(inode);
+	ex = path[depth].p_ext;
+	ee_block = le32_to_cpu(ex->ee_block);
+	ee_len = ext4_ext_get_actual_len(ex);
+	newblock = split - ee_block + ext4_ext_pblock(ex);//分割点的物理块号
+
+	BUG_ON(split < ee_block || split >= (ee_block + ee_len));
+	BUG_ON(!ext4_ext_is_unwritten(ex) &&
+	       split_flag & (EXT4_EXT_MAY_ZEROOUT |
+			     EXT4_EXT_MARK_UNWRIT1 |
+			     EXT4_EXT_MARK_UNWRIT2));
+
+	err = ext4_ext_get_access(handle, inode, path + depth);
+	if (err)
+		goto out;
+
+	if (split == ee_block) {//不需要分割
+		/*
+		 * case b: block @split is the block that the extent begins with
+		 * then we just change the state of the extent, and splitting
+		 * is not needed.
+		 */
+		if (split_flag & EXT4_EXT_MARK_UNWRIT2)
+			ext4_ext_mark_unwritten(ex);
+		else
+			ext4_ext_mark_initialized(ex);
+
+		if (!(flags & EXT4_GET_BLOCKS_PRE_IO))
+			ext4_ext_try_to_merge(handle, inode, path, ex); //尝试把ex前后的ext4_extent结构的逻辑块和物理块地址合并到ex
+		/*ext4_extent映射的逻辑块范围可能发生变化了，标记对应的物理块映射的bh或者文件inode脏*/
+		err = ext4_ext_dirty(handle, inode, path + path->p_depth);
+		goto out;
+	}
+
+	/* case a 需要分割*/
+	memcpy(&orig_ex, ex, sizeof(orig_ex)); //orig_ex先保存ex原有数据
+	/*重点，标记ex->ee_len为映射的block数，这样ex就是被标记初始化状态了，
+	因为ex->ee_len只要不是没被标记EXT_INIT_MAX_LEN，就是初始化状态，
+	但是一旦下边执行ext4_ext_mark_uninitialized(ex)，ex又成未初始化状态了*/
+	ex->ee_len = cpu_to_le16(split - ee_block);
+	if (split_flag & EXT4_EXT_MARK_UNWRIT1)
+		ext4_ext_mark_unwritten(ex);
+
+	/*
+	 * path may lead to new leaf, not to original leaf any more
+	 * after ext4_ext_insert_extent() returns,
+	 */
+	err = ext4_ext_dirty(handle, inode, path + depth);
+	if (err)
+		goto fix_extent_len;
+
+	ex2 = &newex;
+	ex2->ee_block = cpu_to_le32(split);
+	ex2->ee_len   = cpu_to_le16(ee_len - (split - ee_block));
+	ext4_ext_store_pblock(ex2, newblock);
+	if (split_flag & EXT4_EXT_MARK_UNWRIT2)
+		ext4_ext_mark_unwritten(ex2);
+	//把ex分割的后半段ext4_extent结构即ex2添加到ext4 extent B+树
+	path = ext4_ext_insert_extent(handle, inode, path, &newex, flags);
+	if (!IS_ERR(path))
+		goto out;
+
+	err = PTR_ERR(path);
+	if (err != -ENOSPC && err != -EDQUOT && err != -ENOMEM)
+		return path;
+
+	/*
+	 * Get a new path to try to zeroout or fix the extent length.
+	 * Using EXT4_EX_NOFAIL guarantees that ext4_find_extent()
+	 * will not return -ENOMEM, otherwise -ENOMEM will cause a
+	 * retry in do_writepages(), and a WARN_ON may be triggered
+	 * in ext4_da_update_reserve_space() due to an incorrect
+	 * ee_len causing the i_reserved_data_blocks exception.
+	 */
+	path = ext4_find_extent(inode, ee_block, NULL, flags | EXT4_EX_NOFAIL);
+	if (IS_ERR(path)) {
+		EXT4_ERROR_INODE(inode, "Failed split extent on %u, err %ld",
+				 split, PTR_ERR(path));
+		return path;
+	}
+	depth = ext_depth(inode);
+	ex = path[depth].p_ext;
+
+	if (EXT4_EXT_MAY_ZEROOUT & split_flag) {
+		if (split_flag & (EXT4_EXT_DATA_VALID1|EXT4_EXT_DATA_VALID2)) {
+			if (split_flag & EXT4_EXT_DATA_VALID1) {
+				err = ext4_ext_zeroout(inode, ex2);
+				zero_ex.ee_block = ex2->ee_block;
+				zero_ex.ee_len = cpu_to_le16(
+						ext4_ext_get_actual_len(ex2));
+				ext4_ext_store_pblock(&zero_ex,
+						      ext4_ext_pblock(ex2));
+			} else {
+				err = ext4_ext_zeroout(inode, ex);
+				zero_ex.ee_block = ex->ee_block;
+				zero_ex.ee_len = cpu_to_le16(
+						ext4_ext_get_actual_len(ex));
+				ext4_ext_store_pblock(&zero_ex,
+						      ext4_ext_pblock(ex));
+			}
+		} else {
+			err = ext4_ext_zeroout(inode, &orig_ex);
+			zero_ex.ee_block = orig_ex.ee_block;
+			zero_ex.ee_len = cpu_to_le16(
+						ext4_ext_get_actual_len(&orig_ex));
+			ext4_ext_store_pblock(&zero_ex,
+					      ext4_ext_pblock(&orig_ex));
+		}
+
+		if (!err) {
+			/* update the extent length and mark as initialized */
+			ex->ee_len = cpu_to_le16(ee_len);
+			ext4_ext_try_to_merge(handle, inode, path, ex);
+			err = ext4_ext_dirty(handle, inode, path + path->p_depth);
+			if (!err)
+				/* update extent status tree */
+				ext4_zeroout_es(inode, &zero_ex);
+			/* If we failed at this point, we don't know in which
+			 * state the extent tree exactly is so don't try to fix
+			 * length of the original extent as it may do even more
+			 * damage.
+			 */
+			goto out;
+		}
+	}
+
+fix_extent_len:
+	ex->ee_len = orig_ex.ee_len;
+	/*
+	 * Ignore ext4_ext_dirty return value since we are already in error path
+	 * and err is a non-zero error code.
+	 */
+	ext4_ext_dirty(handle, inode, path + path->p_depth);
+out:
+	if (err) {
+		ext4_free_ext_path(path);
+		path = ERR_PTR(err);
+	}
+	ext4_ext_show_leaf(inode, path);
+	return path;
+}
+
+
+
+
+/*
+ * ext4_ext_insert_extent:
+ * tries to merge requested extent into the existing extent or
+ * inserts requested extent as new one into the tree,
+ * creating new leaf in the no-space case.
+ */
+struct ext4_ext_path *
+ext4_ext_insert_extent(handle_t *handle, struct inode *inode,
+		       struct ext4_ext_path *path,
+		       struct ext4_extent *newext, int gb_flags)
+{
+	struct ext4_extent_header *eh;
+	struct ext4_extent *ex, *fex;
+	struct ext4_extent *nearex; /* nearest extent */
+	int depth, len, err = 0;
+	ext4_lblk_t next;
+	int mb_flags = 0, unwritten;
+
+	if (gb_flags & EXT4_GET_BLOCKS_DELALLOC_RESERVE)
+		mb_flags |= EXT4_MB_DELALLOC_RESERVED;
+	if (unlikely(ext4_ext_get_actual_len(newext) == 0)) {
+		EXT4_ERROR_INODE(inode, "ext4_ext_get_actual_len(newext) == 0");
+		err = -EFSCORRUPTED;
+		goto errout;
+	}
+	depth = ext_depth(inode);
+	ex = path[depth].p_ext;
+	eh = path[depth].p_hdr;
+	if (unlikely(path[depth].p_hdr == NULL)) {
+		EXT4_ERROR_INODE(inode, "path[%d].p_hdr == NULL", depth);
+		err = -EFSCORRUPTED;
+		goto errout;
+	}
+
+   /*下判断newex跟ex、ex前边的ext4_extent结构、ex后边的ext4_extent结构逻辑块地址范围是否紧挨着，
+   是的话才能将二者合并。但能合并还要符合一个苛刻条件:
+   参与合并的两个ext4_extent必须是initialized状态，否则无法合并*/
+	/* try to insert block into found extent and return */
+	if (ex && !(gb_flags & EXT4_GET_BLOCKS_PRE_IO)) {
+
+		/*
+		 * Try to see whether we should rather test the extent on
+		 * right from ex, or from the left of ex. This is because
+		 * ext4_find_extent() can return either extent on the
+		 * left, or on the right from the searched position. This
+		 * will make merging more effective.
+		 */
+		if (ex < EXT_LAST_EXTENT(eh) &&
+		    (le32_to_cpu(ex->ee_block) +
+		    ext4_ext_get_actual_len(ex) <
+		    le32_to_cpu(newext->ee_block))) {
+			ex += 1;
+			goto prepend;
+		} else if ((ex > EXT_FIRST_EXTENT(eh)) &&
+			   (le32_to_cpu(newext->ee_block) +
+			   ext4_ext_get_actual_len(newext) <
+			   le32_to_cpu(ex->ee_block)))
+			ex -= 1;
+
+		/* Try to append newex to the ex 与前边extern合并*/
+		if (ext4_can_extents_be_merged(inode, ex, newext)) {
+			ext_debug(inode, "append [%d]%d block to %u:[%d]%d"
+				  "(from %llu)\n",
+				  ext4_ext_is_unwritten(newext),
+				  ext4_ext_get_actual_len(newext),
+				  le32_to_cpu(ex->ee_block),
+				  ext4_ext_is_unwritten(ex),
+				  ext4_ext_get_actual_len(ex),
+				  ext4_ext_pblock(ex));
+			err = ext4_ext_get_access(handle, inode,
+						  path + depth);
+			if (err)
+				goto errout;
+			unwritten = ext4_ext_is_unwritten(ex);
+			ex->ee_len = cpu_to_le16(ext4_ext_get_actual_len(ex)
+					+ ext4_ext_get_actual_len(newext));
+			if (unwritten)
+				ext4_ext_mark_unwritten(ex);
+			nearex = ex;
+			goto merge;
+		}
+
+prepend:
+		/* Try to prepend newex to the ex 与后边extern合并*/
+		if (ext4_can_extents_be_merged(inode, newext, ex)) {
+			ext_debug(inode, "prepend %u[%d]%d block to %u:[%d]%d"
+				  "(from %llu)\n",
+				  le32_to_cpu(newext->ee_block),
+				  ext4_ext_is_unwritten(newext),
+				  ext4_ext_get_actual_len(newext),
+				  le32_to_cpu(ex->ee_block),
+				  ext4_ext_is_unwritten(ex),
+				  ext4_ext_get_actual_len(ex),
+				  ext4_ext_pblock(ex));
+			err = ext4_ext_get_access(handle, inode,
+						  path + depth);
+			if (err)
+				goto errout;
+
+			unwritten = ext4_ext_is_unwritten(ex);
+			ex->ee_block = newext->ee_block;
+			ext4_ext_store_pblock(ex, ext4_ext_pblock(newext));
+			ex->ee_len = cpu_to_le16(ext4_ext_get_actual_len(ex)
+					+ ext4_ext_get_actual_len(newext));
+			if (unwritten)
+				ext4_ext_mark_unwritten(ex);
+			nearex = ex;
+			goto merge;
+		}
+	}
+
+	depth = ext_depth(inode);
+	eh = path[depth].p_hdr;
+	/*eh->eh_max是ext4_extent B+树叶子节点最大ext4_extent个数，
+	这是测试path[depth].p_hdr所在叶子节点的ext4_extent结构是否爆满，
+	没有爆满才会跳到has_space分支*/
+	if (le16_to_cpu(eh->eh_entries) < le16_to_cpu(eh->eh_max))
+		goto has_space;
+
+	/* probably next leaf has space for us? */
+	fex = EXT_LAST_EXTENT(eh);
+	next = EXT_MAX_BLOCKS;
+	  /*如果要插入的newext起始逻辑块地址大于ext4 extent B+树叶子节点最后一个ext4_extent结构的，
+	  说明当前的叶子节点逻辑块地址范围太小了，无法容纳一个完整的extent*/
+	if (le32_to_cpu(newext->ee_block) > le32_to_cpu(fex->ee_block))
+		next = ext4_ext_next_leaf_block(path);//在path上寻找下一个叶子extent_headr，返回逻辑块号
+	if (next != EXT_MAX_BLOCKS) {
+		struct ext4_ext_path *npath;
+
+		ext_debug(inode, "next leaf block - %u\n", next);
+		npath = ext4_find_extent(inode, next, NULL, gb_flags);//根据逻辑块号查找path
+		if (IS_ERR(npath)) {
+			err = PTR_ERR(npath);
+			goto errout;
+		}
+		BUG_ON(npath->p_depth != path->p_depth);
+		eh = npath[depth].p_hdr;
+		if (le16_to_cpu(eh->eh_entries) < le16_to_cpu(eh->eh_max)) {//看下一个叶子extent_headr是否已满
+			ext_debug(inode, "next leaf isn't full(%d)\n",
+				  le16_to_cpu(eh->eh_entries));
+			ext4_free_ext_path(path);
+			path = npath;
+			goto has_space;
+		}
+		ext_debug(inode, "next leaf has no free space(%d,%d)\n",
+			  le16_to_cpu(eh->eh_entries), le16_to_cpu(eh->eh_max));
+		ext4_free_ext_path(npath);
+	}
+
+	/*
+	 * There is no free space in the found leaf.
+	 * We're gonna add a new leaf in the tree.找到的两个叶子节点满了，新建一个
+	 */
+	if (gb_flags & EXT4_GET_BLOCKS_METADATA_NOFAIL)
+		mb_flags |= EXT4_MB_USE_RESERVED;
+	path = ext4_ext_create_new_leaf(handle, inode, mb_flags, gb_flags,
+					path, newext);
+	if (IS_ERR(path))
+		return path;
+	depth = ext_depth(inode);
+	eh = path[depth].p_hdr;
+
+has_space:
+	nearex = path[depth].p_ext;
+
+	err = ext4_ext_get_access(handle, inode, path + depth);
+	if (err)
+		goto errout;
+
+	if (!nearex) {
+		/* there is no extent in this leaf, create first one */
+		ext_debug(inode, "first extent in the leaf: %u:%llu:[%d]%d\n",
+				le32_to_cpu(newext->ee_block),
+				ext4_ext_pblock(newext),
+				ext4_ext_is_unwritten(newext),
+				ext4_ext_get_actual_len(newext));
+		nearex = EXT_FIRST_EXTENT(eh);
+	} else {
+		if (le32_to_cpu(newext->ee_block)
+			   > le32_to_cpu(nearex->ee_block)) {
+			/* Insert after */
+			ext_debug(inode, "insert %u:%llu:[%d]%d before: "
+					"nearest %p\n",
+					le32_to_cpu(newext->ee_block),
+					ext4_ext_pblock(newext),
+					ext4_ext_is_unwritten(newext),
+					ext4_ext_get_actual_len(newext),
+					nearex);
+			nearex++;
+		} else {
+			/* Insert before */
+			BUG_ON(newext->ee_block == nearex->ee_block);
+			ext_debug(inode, "insert %u:%llu:[%d]%d after: "
+					"nearest %p\n",
+					le32_to_cpu(newext->ee_block),
+					ext4_ext_pblock(newext),
+					ext4_ext_is_unwritten(newext),
+					ext4_ext_get_actual_len(newext),
+					nearex);
+		}
+		len = EXT_LAST_EXTENT(eh) - nearex + 1;
+		if (len > 0) {
+			ext_debug(inode, "insert %u:%llu:[%d]%d: "
+					"move %d extents from 0x%p to 0x%p\n",
+					le32_to_cpu(newext->ee_block),
+					ext4_ext_pblock(newext),
+					ext4_ext_is_unwritten(newext),
+					ext4_ext_get_actual_len(newext),
+					len, nearex, nearex + 1);
+			memmove(nearex + 1, nearex,
+				len * sizeof(struct ext4_extent));
+		}
+	}
+
+	le16_add_cpu(&eh->eh_entries, 1);
+	path[depth].p_ext = nearex;
+	nearex->ee_block = newext->ee_block;
+	ext4_ext_store_pblock(nearex, ext4_ext_pblock(newext));
+	nearex->ee_len = newext->ee_len;
+
+merge:
+	/* try to merge extents */
+	if (!(gb_flags & EXT4_GET_BLOCKS_PRE_IO))
+		ext4_ext_try_to_merge(handle, inode, path, nearex);
+
+	/* time to correct all indexes above */
+	err = ext4_ext_correct_indexes(handle, inode, path);
+	if (err)
+		goto errout;
+
+	err = ext4_ext_dirty(handle, inode, path + path->p_depth);
+	if (err)
+		goto errout;
+
+	return path;
+
+errout:
+	ext4_free_ext_path(path);
+	return ERR_PTR(err);
+}
+
 ```
