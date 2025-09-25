@@ -1253,4 +1253,88 @@ errout:
 	return ERR_PTR(err);
 }
 
+
+/*
+ * ext4_ext_create_new_leaf:
+ * finds empty index and adds new leaf.
+ * if no free index is found, then it requests in-depth growing.
+ */
+static struct ext4_ext_path *
+ext4_ext_create_new_leaf(handle_t *handle, struct inode *inode,
+			 unsigned int mb_flags, unsigned int gb_flags,
+			 struct ext4_ext_path *path,
+			 struct ext4_extent *newext)
+{
+	struct ext4_ext_path *curp;
+	int depth, i, err = 0;
+	ext4_lblk_t ee_block = le32_to_cpu(newext->ee_block);
+
+repeat:
+	i = depth = ext_depth(inode);
+
+	/* walk up to the tree and look for free index entry */
+	/*该while是从ext4 extent B+树叶子节点开始，自下而上，向上一直到索引节点，
+	看索引节点或者叶子节点的ext4_extent_idx或ext4_extent个数是否大于最大限制eh_max，
+	超出限制EXT_HAS_FREE_INDEX(curp)返回0，否则返回1.从该while循环退出时，
+	有两种可能，1:curp非NULL，curp指向的索引节点或叶子节点有空闲ext4_extent_idx或ext4_extent可使用，
+	2:i是0，ext4 extent B+树索引节点或叶子节点ext4_extent_idx或ext4_extent个数爆满，
+	没有空闲ext4_extent_idx或ext4_extent可使用*/
+	curp = path + depth;
+	while (i > 0 && !EXT_HAS_FREE_INDEX(curp)) {
+		i--;
+		curp--;
+	}
+
+	/* we use already allocated block for index block,
+	 * so subsequent data blocks should be contiguous */
+	/*ext4 extent B+树索引节点或者叶子节点有空闲ext4_extent_idx或ext4_extent可使用。
+	此时的i表示ext4 extent B+树哪一层有空闲ext4_extent_idx或ext4_extent可使用。
+	newext是要插入ext4_extent B+树的ext4_extent，
+	插入ext4_extent B+树的第i层的叶子节点或者第i层索引节点下边的叶子节点*/
+	if (EXT_HAS_FREE_INDEX(curp)) {
+		/* if we found index with free entry, then use that
+		 * entry: create all needed subtree and add new leaf */
+		err = ext4_ext_split(handle, inode, mb_flags, path, newext, i);
+		if (err)
+			goto errout;
+
+		/* refill path */
+		/*ext4_ext_split()对ext4_extent B+树做了重建和分割，
+		这里再次在ext4_extent B+树查找起始逻辑块地址接近newext->ee_block的索引节点和叶子结点*/
+		path = ext4_find_extent(inode, ee_block, path, gb_flags);
+		return path;
+	}
+
+	/* tree is full, time to grow in depth */
+	/*到这个分支，ext4 extent B+树索引节点的ext4_extent_idx和
+	叶子节点的ext4_extent个数全爆满，没有空闲ext4_extent_idx或ext4_extent可使用，
+	就是说ext4 extent B+树全爆满了，
+	只能增加执行ext4_ext_grow_indepth()增加ext4 extent B+树叶子节点或者索引节点了*/
+	err = ext4_ext_grow_indepth(handle, inode, mb_flags);
+	if (err)
+		goto errout;
+
+	/* refill path */
+	path = ext4_find_extent(inode, ee_block, path, gb_flags);
+	if (IS_ERR(path))
+		return path;
+
+	/*
+	 * only first (depth 0 -> 1) produces free space;
+	 * in all other cases we have to split the grown tree
+	 */
+	depth = ext_depth(inode);
+	if (path[depth].p_hdr->eh_entries == path[depth].p_hdr->eh_max) {
+		/* now we need to split */
+		goto repeat;
+	}
+
+	return path;
+
+errout:
+	ext4_free_ext_path(path);
+	return ERR_PTR(err);
+}
+
+
 ```
