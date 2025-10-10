@@ -11,6 +11,9 @@ ext4_ext_map_blocks
 	->ext4_ext_determine_insert_hole
 	->ext4_mb_new_blocks//没有找到合适的extern节点，新建extern
 	->ext4_ext_insert_extent//把新申请的extent 插入B+树
+		->ext4_ext_create_new_leaf	//执行到该函数，说明ext4 extent B+树中与newext->ee_block有关的叶子节点ext4_extent结构爆满了，需要扩容
+			->ext4_ext_split	//有空间可存放索引节点，于是从ext4 extent B+树at那一层索引节点到叶子节点，针对每一层都创建新的索引节点，也创建叶子节点
+			->ext4_ext_grow_indepth //到这个分支，ext4 extent B+树索引节点的ext4_extent_idx和叶子节点的ext4_extent个数全爆满 增加B+树的层级
 
 /*black 申请/映射/预申请过程
 ext4_ext_map_blocks()函数主要流程有如下几点：
@@ -1292,7 +1295,12 @@ repeat:
 	newext是要插入ext4_extent B+树的ext4_extent，
 	插入ext4_extent B+树的第i层的叶子节点或者第i层索引节点下边的叶子节点*/
 	if (EXT_HAS_FREE_INDEX(curp)) {
-		/* if we found index with free entry, then use that
+		/*凡是执行到ext4_ext_split()函数，说明ext4 extent B+树中与newext->ee_block有关的叶子节点ext4_extent结构爆满了。
+		  但有空间可存放索引节点，于是从ext4 extent B+树at那一层索引节点到叶子节点，针对每一层都创建新的索引节点，
+		  也创建叶子节点。还会尝试把索引节点path[at~depth].p_hdr指向的ext4_extent_idx结构的后边的ext4_extent_idx结构
+		  和path[depth].p_ext指向的ext4_extent结构后边的ext4_extent结构，移动到新创建的叶子节点和索引节点。
+		  这样就能保证ext4 extent B+树中，与newext->ee_block有关的叶子节点有空闲entry，就能存放newext这个ext4_extent结构了。*/
+		  /* if we found index with free entry, then use that
 		 * entry: create all needed subtree and add new leaf */
 		err = ext4_ext_split(handle, inode, mb_flags, path, newext, i);
 		if (err)
@@ -1337,4 +1345,284 @@ errout:
 }
 
 
+/*问题：这里为什么要移动叶子节点和所用节点？？？
+ * ext4_ext_split:
+ * inserts new subtree into the path, using free index entry
+ * at depth @at:
+ * - allocates all needed blocks (new leaf and all intermediate index blocks)
+ * - makes decision where to split
+ * - moves remaining extents and index entries (right to the split point)
+ *   into the newly allocated blocks
+ * - initializes subtree
+ */
+static int ext4_ext_split(handle_t *handle, struct inode *inode,
+			  unsigned int flags,
+			  struct ext4_ext_path *path,
+			  struct ext4_extent *newext, int at)
+{
+	struct buffer_head *bh = NULL;
+	int depth = ext_depth(inode);
+	struct ext4_extent_header *neh;
+	struct ext4_extent_idx *fidx;
+	int i = at, k, m, a; /*newext是要插入ext4_extent B+树的ext4_extent，在ext4_extent B+树的第at层插入newext，第at层的索引节点有空闲entry*/
+	ext4_fsblk_t newblock, oldblock;
+	__le32 border;
+	ext4_fsblk_t *ablocks = NULL; /* array of allocated blocks */
+	gfp_t gfp_flags = GFP_NOFS;
+	int err = 0;
+	size_t ext_size = 0;
+
+	if (flags & EXT4_EX_NOFAIL)
+		gfp_flags |= __GFP_NOFAIL;
+
+	/* make decision: where to split? */
+	/* FIXME: now decision is simplest: at current extent */
+
+	/* if current leaf will be split, then we should use
+	 * border from split point */
+	if (unlikely(path[depth].p_ext > EXT_MAX_EXTENT(path[depth].p_hdr))) {
+		EXT4_ERROR_INODE(inode, "p_ext > EXT_MAX_EXTENT!");
+		return -EFSCORRUPTED;
+	}
+	/*path[depth].p_ext是ext4 extent B+树叶子节点中，逻辑块地址最接近map->m_lblk这个起始逻辑块地址的ext4_extent*/
+	if (path[depth].p_ext != EXT_MAX_EXTENT(path[depth].p_hdr)) {
+		 /*path[depth].p_ext不是叶子节点最后一个ext4_extent结构，
+		 那以它后边的ext4_extent结构path[depth].p_ext[1]的起始逻辑块地址作为分割点border*/
+		border = path[depth].p_ext[1].ee_block;
+		ext_debug(inode, "leaf will be split."
+				" next leaf starts at %d\n",
+				  le32_to_cpu(border));
+	} else {
+		/*这里说明path[depth].p_ext指向的是叶子节点最后一个ext4_extent结构*/
+		border = newext->ee_block;
+		ext_debug(inode, "leaf will be added."
+				" next leaf starts at %d\n",
+				le32_to_cpu(border));
+	}
+
+	/*
+	 * If error occurs, then we break processing
+	 * and mark filesystem read-only. index won't
+	 * be inserted and tree will be in consistent
+	 * state. Next mount will repair buffers too.
+	 */
+
+	/*
+	 * Get array to track all allocated blocks.
+	 * We need this to handle errors and free blocks
+	 * upon them.
+	 */
+	ablocks = kcalloc(depth, sizeof(ext4_fsblk_t), gfp_flags);
+	if (!ablocks)
+		return -ENOMEM;
+
+	/* allocate all needed blocks */
+	ext_debug(inode, "allocate %d blocks for indexes/leaf\n", depth - at);
+	for (a = 0; a < depth - at; a++) {
+		 /*分配(depth - at)个物理块，newext是在ext4 extent B+的第at层插入，
+		 从at层到depth层，每层分配一个物理块,for indexes/leaf*/
+		newblock = ext4_ext_new_meta_block(handle, inode, path,
+						   newext, &err, flags);
+		if (newblock == 0)
+			goto cleanup;
+		ablocks[a] = newblock;
+	}
+
+	/* initialize new leaf 最后一层存放的总是叶子节点*/
+	newblock = ablocks[--a];
+	if (unlikely(newblock == 0)) {
+		EXT4_ERROR_INODE(inode, "newblock == 0!");
+		err = -EFSCORRUPTED;
+		goto cleanup;
+	}
+	bh = sb_getblk_gfp(inode->i_sb, newblock, __GFP_MOVABLE | GFP_NOFS);
+	if (unlikely(!bh)) {
+		err = -ENOMEM;
+		goto cleanup;
+	}
+	lock_buffer(bh);
+
+	err = ext4_journal_get_create_access(handle, inode->i_sb, bh,
+					     EXT4_JTR_NONE);
+	if (err)
+		goto cleanup;
+	//初始化叶子结点数组的头
+	neh = ext_block_hdr(bh);
+	neh->eh_entries = 0;
+	neh->eh_max = cpu_to_le16(ext4_ext_space_block(inode, 0));
+	neh->eh_magic = EXT4_EXT_MAGIC;
+	neh->eh_depth = 0;
+	neh->eh_generation = 0;
+
+	/*从path[depth].p_ext后边的ext4_extent结构到叶子节点最后一个ext4_extent结构之间，一共有m个ext4_extent结构*/
+	/* move remainder of path[depth] to the new leaf */
+	if (unlikely(path[depth].p_hdr->eh_entries !=
+		     path[depth].p_hdr->eh_max)) {
+		EXT4_ERROR_INODE(inode, "eh_entries %d != eh_max %d!",
+				 path[depth].p_hdr->eh_entries,
+				 path[depth].p_hdr->eh_max);
+		err = -EFSCORRUPTED;
+		goto cleanup;
+	}
+	/* start copy from next extent */
+	m = EXT_MAX_EXTENT(path[depth].p_hdr) - path[depth].p_ext++;
+	ext4_ext_show_move(inode, path, newblock, depth);
+	if (m) {
+		struct ext4_extent *ex;
+		ex = EXT_FIRST_EXTENT(neh);
+		//老的叶子节点path[depth].p_ext后的m个ext4_extent结构移动到上边新分配的叶子节点
+		memmove(ex, path[depth].p_ext, sizeof(struct ext4_extent) * m);
+		le16_add_cpu(&neh->eh_entries, m);
+	}
+
+	/* zero out unused area in the extent block */
+	ext_size = sizeof(struct ext4_extent_header) +
+		sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries);
+	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+	ext4_extent_block_csum_set(inode, neh);
+	set_buffer_uptodate(bh);
+	unlock_buffer(bh);
+
+	err = ext4_handle_dirty_metadata(handle, inode, bh);
+	if (err)
+		goto cleanup;
+	brelse(bh);
+	bh = NULL;
+
+	/* correct old leaf */
+	if (m) {
+		err = ext4_ext_get_access(handle, inode, path + depth);
+		if (err)
+			goto cleanup;
+		le16_add_cpu(&path[depth].p_hdr->eh_entries, -m);
+		err = ext4_ext_dirty(handle, inode, path + depth);
+		if (err)
+			goto cleanup;
+
+	}
+	
+	/*最后一层的叶子节点操作完成，现在要操作at层到叶子节点层之间的索引节点层*/
+	/*ext4_extent B+树at那一层的索引节点到最后一层索引节点之间的层数，就是从at开始有多少层索引节点*/
+	/* create intermediate indexes */
+	k = depth - at - 1;
+	if (unlikely(k < 0)) {
+		EXT4_ERROR_INODE(inode, "k %d < 0!", k);
+		err = -EFSCORRUPTED;
+		goto cleanup;
+	}
+	if (k)
+		ext_debug(inode, "create %d intermediate indices\n", k);
+	/* insert new index into current index block */
+	/* current depth stored in i var */
+	i = depth - 1;
+	while (k--) {
+		oldblock = newblock;//存放叶子节点的block号
+		newblock = ablocks[--a];
+		bh = sb_getblk(inode->i_sb, newblock);
+		if (unlikely(!bh)) {
+			err = -ENOMEM;
+			goto cleanup;
+		}
+		lock_buffer(bh);
+
+		err = ext4_journal_get_create_access(handle, inode->i_sb, bh,
+						     EXT4_JTR_NONE);
+		if (err)
+			goto cleanup;
+
+		neh = ext_block_hdr(bh);
+		neh->eh_entries = cpu_to_le16(1);
+		neh->eh_magic = EXT4_EXT_MAGIC;
+		neh->eh_max = cpu_to_le16(ext4_ext_space_block_idx(inode, 0));
+		neh->eh_depth = cpu_to_le16(depth - i);
+		neh->eh_generation = 0;
+		fidx = EXT_FIRST_INDEX(neh);
+		fidx->ei_block = border;
+		ext4_idx_store_pblock(fidx, oldblock);//将叶子检点的block号设置到索引节点中
+
+		ext_debug(inode, "int.index at %d (block %llu): %u -> %llu\n",
+				i, newblock, le32_to_cpu(border), oldblock);
+
+		/* move remainder of path[i] to the new index block */
+		if (unlikely(EXT_MAX_INDEX(path[i].p_hdr) !=
+					EXT_LAST_INDEX(path[i].p_hdr))) {
+			EXT4_ERROR_INODE(inode,
+					 "EXT_MAX_INDEX != EXT_LAST_INDEX ee_block %d!",
+					 le32_to_cpu(path[i].p_ext->ee_block));
+			err = -EFSCORRUPTED;
+			goto cleanup;
+		}
+		/*计算 path[i].p_hdr这一层索引节点中，
+		从path[i].p_idx指向的ext4_extent_idx结构到最后一个ext4_extent_idx结构之间ext4_extent_idx个数*/
+		/* start copy indexes */
+		m = EXT_MAX_INDEX(path[i].p_hdr) - path[i].p_idx++;
+		ext_debug(inode, "cur 0x%p, last 0x%p\n", path[i].p_idx,
+				EXT_MAX_INDEX(path[i].p_hdr));
+		ext4_ext_show_move(inode, path, newblock, i);
+		if (m) {
+			/*把path[i].p_idx后边的m个ext4_extent_idx结构
+			赋值到newblock这个物理块对应的索引节点开头的第1个ext4_extent_idx的后边，
+			即fidx指向的ext4_extent_idx后边。这里是++fid，
+			即fidx指向的索引节点的第2个ext4_extent_idx位置处，
+			这是向索引节点第2个ext4_extent_idx处及后边复制m个ext4_extent_idx结构*/
+			memmove(++fidx, path[i].p_idx,
+				sizeof(struct ext4_extent_idx) * m);
+			le16_add_cpu(&neh->eh_entries, m);
+		}
+		/* zero out unused area in the extent block */
+		ext_size = sizeof(struct ext4_extent_header) +
+		   (sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries));
+		memset(bh->b_data + ext_size, 0,
+			inode->i_sb->s_blocksize - ext_size);
+		ext4_extent_block_csum_set(inode, neh);
+		set_buffer_uptodate(bh);
+		unlock_buffer(bh);
+
+		err = ext4_handle_dirty_metadata(handle, inode, bh);
+		if (err)
+			goto cleanup;
+		brelse(bh);
+		bh = NULL;
+
+		/* correct old index */
+		if (m) {
+			err = ext4_ext_get_access(handle, inode, path + i);
+			if (err)
+				goto cleanup;
+			le16_add_cpu(&path[i].p_hdr->eh_entries, -m);
+			err = ext4_ext_dirty(handle, inode, path + i);
+			if (err)
+				goto cleanup;
+		}
+
+		i--;
+	}
+
+	/* insert new index */
+	/*把新的索引节点的ext4_extent_idx结构(起始逻辑块地址border,
+	物理块号newblock)插入到ext4 extent B+树at那一层
+	索引节点(path + at)->p_idx指向的ext4_extent_idx结构前后。*/
+	err = ext4_ext_insert_index(handle, inode, path + at,
+				    le32_to_cpu(border), newblock);
+
+cleanup:
+	if (bh) {
+		if (buffer_locked(bh))
+			unlock_buffer(bh);
+		brelse(bh);
+	}
+
+	if (err) {
+		/* free all allocated blocks in error case */
+		for (i = 0; i < depth; i++) {
+			if (!ablocks[i])
+				continue;
+			ext4_free_blocks(handle, inode, NULL, ablocks[i], 1,
+					 EXT4_FREE_BLOCKS_METADATA);
+		}
+	}
+	kfree(ablocks);
+
+	return err;
+}
 ```
