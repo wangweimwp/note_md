@@ -1625,4 +1625,297 @@ cleanup:
 
 	return err;
 }
+
+/*
+1:首先确定ext4 extent B+树的分割点逻辑地址border。
+如果path[depth].p_ext不是ext4_extent B+树叶子节点节点最后一个ext4 extent结构，
+则分割点逻辑地址border是path[depth].p_ext后边的ext4_extent起始逻辑块地址，
+即border=path[depth].p_ext[1].ee_block。否则border是新插入ext4 extent B+树的
+ext4_extent的起始逻辑块地址，即newext->ee_block。
+
+2:因为ext4_extent B+树at那一层索引节点有空闲entry，
+则针对at~depth(B+树深度)之间的的每一层索引节点和叶子节点都分配新的索引节点和叶子结点，
+每个索引节点和叶子结点都占一个block大小(4K)，分别保存N个ext4_extent_idx结构
+和N个ext4_extent结构，还有ext4_extent_header。在while (k--)那个循环，
+这些新分配的索引节点和叶子节点中，B+树倒数第2层的那个索引节点的第一个ext4_extent_idx的
+物理块号成员(ei_leaf_lo和ei_leaf_hi)记录的新分配的保存叶子结点4K数据的物理块号
+(代码是ext4_idx_store_pblock(fidx, oldblock))，第一个ext4_extent_idx的起始逻辑块地址是border
+(代码是fidx->ei_block = border)。B+树倒数第3层的那个索引节点的第一个ext4_extent_idx的
+物理块号成员记录的是保存倒数第2层的索引节点4K数据的物理块号，
+这层索引节点第一个ext4_extent_idx的起始逻辑块地址是border
+(代码是fidx->ei_block = border)........其他类推。at那一层新分配的索引节点
+(物理块号是newblock，起始逻辑块地址border)，执行ext4_ext_insert_index()插入到
+ext4_extent B+树at层原有的索引节点(path + at)->p_idx指向的ext4_extent_idx结构前后的
+ext4_extent_idx结构位置处。插入过程是:把(path + at)->p_idx指向的索引节点的ext4_extent_idx
+结构后的所有ext4_extent_idx结构向后移动一个ext4_extent_idx结构大小，这就在(path + at)->p_idx
+指向的索引节点的ext4_extent_idx处腾出了一个空闲的ext4_extent_idx结构大小空间，
+新分配的索引节点就是插入到这里。
+
+3:要把ext4_extent B+树原来的at~depth层的 path[i].p_idx~path[depth-1].p_idx指向的ext4_extent_idx
+结构后边的所有ext4_extent_idx结构 和 path[depth].p_ext指向的ext4_extent后的所有
+ext4_extent结构都对接移动到上边针对ext4_extent B+树at~denth新分配索引节点和叶子节点物理块号映射bh内存。
+这是对原有的ext4 extent B+树进行扩容的重点。
+
+上边的解释没有诠释到本质。直击灵魂，
+为什么会执行到ext4_ext_insert_extent()->ext4_ext_create_new_leaf()->ext4_ext_split()?有什么意义?
+首先，ext4_split_extent_at()函数中，把path[depth].p_ext指向的ext4_extent结构(即ex)的逻辑块范围分割成两段，
+两个ext4_extent结构。前边的ext4_extent结构还是ex，只是逻辑块范围减少了。
+而后半段ext4_extent结构即newext就要插入插入到到ext4 extent B+树。
+到ext4_ext_insert_extent()函数，如果此时ex所在叶子节点的ext4_extent结构爆满了，
+即if (le16_to_cpu(eh->eh_entries) < le16_to_cpu(eh->eh_max))不成立，
+但是if (le32_to_cpu(newext->ee_block) > le32_to_cpu(fex->ee_block))成立，
+即newext的起始逻辑块地址小于ex所在叶子节点的最后一个ext4_extent结构的起始逻辑块地址，
+则执行next = ext4_ext_next_leaf_block(path)等代码，回到上层索引节点，
+找到起始逻辑块地址更大的索引节点和叶子节点，如果新的叶子节点的ext4_extent结构还是爆满，
+那就要执行ext4_ext_create_new_leaf()增大ext4_extent B+树层数了。
+
+来到ext4_ext_create_new_leaf()函数，从最底层的索引节点开始向上搜索，找到有空闲entry的索引节点。
+如果找到则执行ext4_ext_split()。如果找不到则执行ext4_ext_grow_indepth()
+在ext4_extent B+树root节点增加一层索引节点(或叶子节点)，然后也执行ext4_ext_split()。
+
+当执行到ext4_ext_split()，at一层的ext4_extent B+树有空闲entry，则以从at层到叶子节点那一层，
+创建新的索引节点和叶子节点，建立这些新的索引节点和叶子节点彼此的物理块号的联系。
+我们假设ext4_ext_split()的if (path[depth].p_ext != EXT_MAX_EXTENT(path[depth].p_hdr))成立，
+则这样执行：向新分配的叶子节点复制m个ext4_extent结构时，复制的第一个ext4_extent结构不是path[depth].p_ext，
+而是它后边的 path[depth].p_ext[1]这个ext4_extent结构。并且，
+下边新创建的索引节点的第一个ext4_extent_idx结构的起始逻辑器块地址都是border，
+即path[depth].p_ext[1]的逻辑块地址，也是path[depth].p_ext[1].ee_block。
+然后向新传创建的索引节点的第2个ext4_extent_idx结构处及之后复制m个ext4_extent_idx结构。
+新传创建的索引节点的第一个ext4_extent_idx的起始逻辑块地址是border，单独使用，作为分割点的ext4_extent_idx结构。
+如此，后续执行ext4_ext_find_extent(newext->ee_block)在老的ext4_extent B+树找到的path[depth].p_ext指向的ext4_extent还是老的，
+但是path[depth].p_ext后边的m个ext4_extent结构移动到了新分配的叶子节点，
+path[depth].p_ext所在叶子节点就有空间了，newext就插入到path[depth].p_ext指向的ext4_extent叶子节点后边。
+这段代码在ext4_ext_insert_extent()的has_space 的if (!nearex)........} else{......}的else分支。
+
+如果ext4_ext_split()的if (path[depth].p_ext != EXT_MAX_EXTENT(path[depth].p_hdr))不成立，则这样执行：
+不会向新分配的叶子节点复制ext4_extent结构，m是0，因为path[depth].p_ext就是叶子节点最后一个ext4_extent结构，
+下边的m = EXT_MAX_EXTENT(path[depth].p_hdr) - path[depth].p_ext++=0。并且，下边新创建的索引节点的第一个ext4_extent_idx结构
+的起始逻辑器块地址都是newext->ee_block。这样后续执行ext4_ext_find_extent()在
+ext4_extent B+树就能找到起始逻辑块地址是newext->ee_block的层层索引节点了，完美匹配。
+那叶子节点呢?这个分支没有向新的叶子节点复制ext4_extent结构，空的，ext4_ext_find_extent()执行后，
+path[ppos].depth指向新的叶子节点的头结点，
+此时直接令该叶子节点的第一个ext4_extent结构的逻辑块地址是newext->ee_block，完美!
+这段代码在ext4_ext_insert_extent()的has_space 的if (!nearex)分支。
+
+注意，这是ext4_extent B+树叶子节点增加增加的第一个ext4_extent结构，
+并且第一个ext4_extent结构的起始逻辑块地址与它上边的索引节点的ext4_extent_idx的起始逻辑块地址都是newext->ee_block，
+再上层的索引节点的ext4_extent_idx的起始逻辑块地址也是newext->ee_block，直到第at层。
+
+因此，我们看到ext4_ext_split()最核心的作用是：at一层的ext4_extent B+树有空闲entry，
+则从at层开始创建新的索引节点和叶子节点，建立这些新的索引节点和叶子节点彼此的物理块号联系。
+然后把path[depth].p_ext后边的ext4_extent结构移动到新的叶子节点，
+把path[at~depth-1].p_idx这些索引节点后边的ext4_extent_idx结构依次移动到新创建的索引节点。
+这样要么老的path[depth].p_ext所在叶子节点有了空闲的ext4_extent entry，
+把newex插入到老的path[depth].p_ext所在叶子节点后边即可。或者新创建的at~denth的索引节点
+
+和叶子节点，有大量空闲的entry，这些索引节点的起始逻辑块地址还是newext->ee_block，
+则直接把newext插入到新创建的叶子节点第一个ext4_extent结构即可。
+
+最后，对ext4_ext_split简单总结: 凡是执行到ext4_ext_split()函数，
+说明ext4 extent B+树中与newext->ee_block有关的叶子节点ext4_extent结构爆满了。
+于是从ext4 extent B+树at那一层索引节点到叶子节点，针对每一层都创建新的索引节点，
+也创建叶子节点。还会尝试把索引节点path[at~depth].p_hdr指向的ext4_extent_idx
+结构的后边的ext4_extent_idx结构和path[depth].p_ext指向的ext4_extent结构后边的ext4_extent结构，
+移动到新创建的叶子节点和索引节点。这样可能保证ext4 extent B+树中，与newext->ee_block有关的叶子节点有空闲entry，能存放newext。
+
+*/
+
+/*
+ * ext4_ext_insert_index:
+ * insert new index [@logical;@ptr] into the block at @curp;
+ * check where to insert: before @curp or after @curp
+ */
+static int ext4_ext_insert_index(handle_t *handle, struct inode *inode,
+				 struct ext4_ext_path *curp,
+				 int logical, ext4_fsblk_t ptr)
+{
+	struct ext4_extent_idx *ix;
+	int len, err;
+	
+	/*curp->p_idx是ext4 extent B+树起始逻辑块地址最接近传入的起始逻辑块地址map->m_lblk的ext4_extent_idx结构，
+	现在是把新的ext4_extent_idx(起始逻辑块地址是logical,起始物理块号ptr)插入到curp->p_idx指向的ext4_extent_idx结构前后*/
+	err = ext4_ext_get_access(handle, inode, curp);
+	if (err)
+		return err;
+
+	if (unlikely(logical == le32_to_cpu(curp->p_idx->ei_block))) {
+		EXT4_ERROR_INODE(inode,
+				 "logical %d == ei_block %d!",
+				 logical, le32_to_cpu(curp->p_idx->ei_block));
+		return -EFSCORRUPTED;
+	}
+
+	if (unlikely(le16_to_cpu(curp->p_hdr->eh_entries)
+			     >= le16_to_cpu(curp->p_hdr->eh_max))) {
+		EXT4_ERROR_INODE(inode,
+				 "eh_entries %d >= eh_max %d!",
+				 le16_to_cpu(curp->p_hdr->eh_entries),
+				 le16_to_cpu(curp->p_hdr->eh_max));
+		return -EFSCORRUPTED;
+	}
+
+	if (logical > le32_to_cpu(curp->p_idx->ei_block)) {
+		/*待插入的ext4_extent_idx结构起始逻辑块地址logical大于curp->p_idx的起始逻辑块地址， 
+		就要插入curp->p_idx这个ext4_extent_idx后边，(curp->p_idx + 1)这个ext4_extent_idx后边。
+		插入前，下边memmove先把(curp->p_idx+1)后边的所有ext4_extent_idx结构全向后移动一个ext4_extent_idx结构大小，
+		然后把新的ext4_extent_idx插入到curp->p_idx + 1位置处*/
+		/* insert after */
+		ext_debug(inode, "insert new index %d after: %llu\n",
+			  logical, ptr);
+		ix = curp->p_idx + 1;
+	} else {
+		/*待插入的ext4_extent_idx结构起始逻辑块地址logical更小，就插入到curp->p_idx这个ext4_extent_idx前边。插入前，
+		下边memmove先把curp->p_idx后边的所有ext4_extent_idx结构全向后移动一个ext4_extent_idx结构大小，
+		然后把新的ext4_extent_idx插入到curp->p_idx位置处*/
+		/* insert before */
+		ext_debug(inode, "insert new index %d before: %llu\n",
+			  logical, ptr);
+		ix = curp->p_idx;
+	}
+
+	if (unlikely(ix > EXT_MAX_INDEX(curp->p_hdr))) {
+		EXT4_ERROR_INODE(inode, "ix > EXT_MAX_INDEX!");
+		return -EFSCORRUPTED;
+	}
+    /*ix是curp->p_idx或者(curp->p_idx+1)。len是ix这个索引节点的ext4_extent_idx结构
+	到索引节点最后一个ext4_extent_idx结构(有效的)之间所有的ext4_extent_idx结构个数。
+	注意，EXT_LAST_INDEX(curp->p_hdr)是索引节点最后一个有效的ext4_extent_idx结构，
+	如果索引节点只有一个ext4_extent_idx结构，那EXT_LAST_INDEX(curp->p_hdr)就指向这第一个ext4_extent_idx结构*/
+	len = EXT_LAST_INDEX(curp->p_hdr) - ix + 1;
+	BUG_ON(len < 0);
+	if (len > 0) {
+		ext_debug(inode, "insert new index %d: "
+				"move %d indices from 0x%p to 0x%p\n",
+				logical, len, ix, ix + 1);
+		/*在分界点，给要插入的节点挪开一个位置*/
+		memmove(ix + 1, ix, len * sizeof(struct ext4_extent_idx));
+	}
+	/*现在ix指向ext4_extent_idx结构是空闲的，用它保存要插入的逻辑块地址logial和对应的物理块号。
+	相当于把本次要插入ext4 extent b+树的ext4_extent_idx插入到ix指向的ext4_extent_idx位置处*/
+	ix->ei_block = cpu_to_le32(logical);
+	ext4_idx_store_pblock(ix, ptr);
+	le16_add_cpu(&curp->p_hdr->eh_entries, 1);
+
+	if (unlikely(ix > EXT_LAST_INDEX(curp->p_hdr))) {
+		EXT4_ERROR_INODE(inode, "ix > EXT_LAST_INDEX!");
+		return -EFSCORRUPTED;
+	}
+
+	err = ext4_ext_dirty(handle, inode, curp);
+	ext4_std_error(inode->i_sb, err);
+
+	return err;
+}
+
+/*
+ * ext4_ext_grow_indepth:
+ * implements tree growing procedure:
+ * - allocates new block
+ * - moves top-level data (index block or leaf) into the new block
+ * - initializes new top-level, creating index that points to the
+ *   just created block
+ */
+static int ext4_ext_grow_indepth(handle_t *handle, struct inode *inode,
+				 unsigned int flags)
+{
+	struct ext4_extent_header *neh;
+	struct buffer_head *bh;
+	ext4_fsblk_t newblock, goal = 0;
+	struct ext4_super_block *es = EXT4_SB(inode->i_sb)->s_es;
+	int err = 0;
+	size_t ext_size = 0;
+
+	/* Try to prepend new index to old one */
+	if (ext_depth(inode))
+		goal = ext4_idx_pblock(EXT_FIRST_INDEX(ext_inode_hdr(inode)));
+	if (goal > le32_to_cpu(es->s_first_data_block)) {
+		flags |= EXT4_MB_HINT_TRY_GOAL;
+		goal--;
+	} else
+		goal = ext4_inode_to_goal_block(inode);
+	
+	/*分配一个新的物理块，返回物理块号newblock。这个物理块4K大小，
+	是本次新创建的索引节点或者叶子节点，将来会保存索引节点的头结构ext4_extent_header+N个ext4_extent_idx
+	或者或者叶子结点ext4_extent_header+N个ext4_extent结构*/
+	newblock = ext4_new_meta_blocks(handle, inode, goal, flags,
+					NULL, &err);
+	if (newblock == 0)
+		return err;
+	//bh映射到newblock这个物理块
+	bh = sb_getblk_gfp(inode->i_sb, newblock, __GFP_MOVABLE | GFP_NOFS);
+	if (unlikely(!bh))
+		return -ENOMEM;
+	lock_buffer(bh);
+
+	err = ext4_journal_get_create_access(handle, inode->i_sb, bh,
+					     EXT4_JTR_NONE);
+	if (err) {
+		unlock_buffer(bh);
+		goto out;
+	}
+
+	ext_size = sizeof(EXT4_I(inode)->i_data);
+	/*把ext4 extent B+树的根节点的数据(头结构ext4_extent_header+4个ext4_extent_idx
+	或者叶子结点ext4_extent_header+4个ext4_extent结构)复制到bh->b_data。
+	相当于把根节点的数据复制到上边新创建的物理块，腾空根节点*/
+	/* move top-level index/leaf into new block */
+	memmove(bh->b_data, EXT4_I(inode)->i_data, ext_size);
+	/* zero out unused area in the extent block */
+	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+
+	/*neh指向bh首地址，这些内存的数据是前边向bh->b_data复制的根节点的头结构ext4_extent_header*/
+	/* set size of new block */
+	neh = ext_block_hdr(bh);
+	//如果ext4 extent B+树有索引节点，neh指向的内存作为索引节点
+	/* old root could have indexes or leaves
+	 * so calculate e_max right way */
+	if (ext_depth(inode))
+		neh->eh_max = cpu_to_le16(ext4_ext_space_block_idx(inode, 0));
+	else//如果ext4 extent B+树没有索引节点，只有根节点，neh指向的内存作为叶子结点
+		neh->eh_max = cpu_to_le16(ext4_ext_space_block(inode, 0));
+	neh->eh_magic = EXT4_EXT_MAGIC;
+	ext4_extent_block_csum_set(inode, neh);
+	set_buffer_uptodate(bh);
+	set_buffer_verified(bh);
+	unlock_buffer(bh);
+
+	err = ext4_handle_dirty_metadata(handle, inode, bh);
+	if (err)
+		goto out;
+
+	/* Update top-level index: num,max,pointer */
+	//现在neh又指向ext4 extent B+根节点
+	neh = ext_inode_hdr(inode);
+	//根节点现在只有一个叶子节点的ext4_extent结构在使用或者只有一个索引节点的ext4_extent_idx结构在使用
+	neh->eh_entries = cpu_to_le16(1);
+	/*这是把前边新创建的索引节点或者叶子节点的物理块号newblock
+	记录到根节点第一个ext4_extent_idx结构的ei_leaf_lo和ei_leaf_hi成员。
+	这样就建立了根节点与新创建的物理块号是newblock的叶子结点或索引节点的联系。
+	因为通过根节点第一个ext4_extent_idx结构的ei_leaf_lo和ei_leaf_hi成员，
+	就可以找到这个新创建的叶子节点或者索引节点的物理块号newblock*/
+	ext4_idx_store_pblock(EXT_FIRST_INDEX(neh), newblock);
+	//如果neh->eh_depth是0，说明之前ext4 extent B+树深度是0，即只有根节点
+	if (neh->eh_depth == 0) {
+		/* Root extent block becomes index block */
+		/*以前B+树只有根节点，没有索引节点。现在根节点作为索引节点，这是计算根节点最多可容纳的ext4_extent_idx结构个数，4*/
+		neh->eh_max = cpu_to_le16(ext4_ext_space_root_idx(inode, 0));
+		/*以前B+树只有根节点，没有索引节点，根节点都是ext4_extent结构，
+		现在B+树根节点下添加了newblock这个叶子节点。根节点成了根索引节点，
+		因此原来第一个ext4_extent结构要换成ext4_extent_idx结构，
+		下边赋值就是把原来的根节点第一个ext4_extent的起始逻辑块地址赋值给现在根节点的第一个ext4_extent_idx的起始逻辑块地址*/
+		EXT_FIRST_INDEX(neh)->ei_block =
+			EXT_FIRST_EXTENT(neh)->ee_block;
+	}
+	ext_debug(inode, "new root: num %d(%d), lblock %d, ptr %llu\n",
+		  le16_to_cpu(neh->eh_entries), le16_to_cpu(neh->eh_max),
+		  le32_to_cpu(EXT_FIRST_INDEX(neh)->ei_block),
+		  ext4_idx_pblock(EXT_FIRST_INDEX(neh)));
+	//ext4 extent B+树增加了一层索引节点或叶子结点，即物理块号是newblock的那个，树深度加1
+	le16_add_cpu(&neh->eh_depth, 1);
+	err = ext4_mark_inode_dirty(handle, inode);
+out:
+	brelse(bh);
+
+	return err;
+}
 ```
