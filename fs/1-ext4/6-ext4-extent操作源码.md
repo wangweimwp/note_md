@@ -1176,21 +1176,25 @@ prepend:
 		return path;
 	depth = ext_depth(inode);
 	eh = path[depth].p_hdr;
-
+/*到这里，最新的path[depth].p_ext所在叶子节点肯定有空闲的ext4_extent，
+即空闲位置可以存放newext这个ext4_extent结构，则直接把newext插入到叶子节点某个合适的ext4_extent位置处*/
 has_space:
+/*nearex指向起始逻辑块地址最接近 newext->ee_block这个起始逻辑块地址的ext4_extent，
+newext是本次要ext4 extent b+树的ext4_extent*/
 	nearex = path[depth].p_ext;
 
 	err = ext4_ext_get_access(handle, inode, path + depth);
 	if (err)
 		goto errout;
 
-	if (!nearex) {
+	if (!nearex) {//path[depth].p_ext所在叶子节点还没有使用过一个ext4_extent结构
 		/* there is no extent in this leaf, create first one */
 		ext_debug(inode, "first extent in the leaf: %u:%llu:[%d]%d\n",
 				le32_to_cpu(newext->ee_block),
 				ext4_ext_pblock(newext),
 				ext4_ext_is_unwritten(newext),
 				ext4_ext_get_actual_len(newext));
+		//nearex指向叶子节点第一个ext4_extent结构，newext就插入到这里
 		nearex = EXT_FIRST_EXTENT(eh);
 	} else {
 		if (le32_to_cpu(newext->ee_block)
@@ -1203,7 +1207,8 @@ has_space:
 					ext4_ext_is_unwritten(newext),
 					ext4_ext_get_actual_len(newext),
 					nearex);
-			nearex++;
+			nearex++;/*newext的起始逻辑块地址大于nearex的起始逻辑块地址，
+			nearex++指向后边的一个ext4_extent结构*/
 		} else {
 			/* Insert before */
 			BUG_ON(newext->ee_block == nearex->ee_block);
@@ -1215,6 +1220,9 @@ has_space:
 					ext4_ext_get_actual_len(newext),
 					nearex);
 		}
+		/*这是计算nearex这个ext4_extent结构到叶子节点最后一个
+		ext4_extent结构(有效的)之间的ext4_extent结构个数。注意"有效的"3个字，
+		比如叶子节点只使用了一个ext4_extent，则EXT_LAST_EXTENT(eh)是叶子节点第一个ext4_extent结构。*/
 		len = EXT_LAST_EXTENT(eh) - nearex + 1;
 		if (len > 0) {
 			ext_debug(inode, "insert %u:%llu:[%d]%d: "
@@ -1224,11 +1232,17 @@ has_space:
 					ext4_ext_is_unwritten(newext),
 					ext4_ext_get_actual_len(newext),
 					len, nearex, nearex + 1);
+			/*这是把nearex这个ext4_extent结构 ~ 最后一个ext4_extent结构(有效的)之间的
+			所有ext4_extent结构的数据整体向后移动一个ext4_extent结构大小，
+			腾出原来nearex这个ext4_extent结构的空间，下边正是把newext插入到这里，
+			这样终于把newex插入ext4_extent B+树了*/
 			memmove(nearex + 1, nearex,
 				len * sizeof(struct ext4_extent));
 		}
 	}
-
+	/*下边是把newext的起始逻辑块地址、起始物理块起始地址、逻辑块地址映射的物理块个数等信息赋值给nearex，
+	相当于把newext添加到叶子节点原来nearex的位置。然后叶子节点ext4_extent个数加1。
+	path[depth].p_ext指向newext*/
 	le16_add_cpu(&eh->eh_entries, 1);
 	path[depth].p_ext = nearex;
 	nearex->ee_block = newext->ee_block;
@@ -1236,6 +1250,9 @@ has_space:
 	nearex->ee_len = newext->ee_len;
 
 merge:
+	/*尝试把ex后的ext4_extent结构的逻辑块和物理块地址合并到ex。
+	并且，如果ext4_extent B+树深度是1，并且叶子结点有很少的ext4_extent结构，
+	则尝试把叶子结点的ext4_extent结构移动到root节点，节省空间而已*/
 	/* try to merge extents */
 	if (!(gb_flags & EXT4_GET_BLOCKS_PRE_IO))
 		ext4_ext_try_to_merge(handle, inode, path, nearex);
@@ -1787,7 +1804,7 @@ static int ext4_ext_insert_index(handle_t *handle, struct inode *inode,
 		ext_debug(inode, "insert new index %d: "
 				"move %d indices from 0x%p to 0x%p\n",
 				logical, len, ix, ix + 1);
-		/*在分界点，给要插入的节点挪开一个位置*/
+		/*在分界点，给要插入的节点腾出一个位置*/
 		memmove(ix + 1, ix, len * sizeof(struct ext4_extent_idx));
 	}
 	/*现在ix指向ext4_extent_idx结构是空闲的，用它保存要插入的逻辑块地址logial和对应的物理块号。
