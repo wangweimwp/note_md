@@ -76,6 +76,8 @@ ext4_da_write_begin
 							->ext4_ext_binsearch_idx	//通过ext4_extent_idx拿掉下一层ext4_extent_idx
 							->read_extent_tree_block	//从磁盘中读取下一层ext4_extent_idx所在的block
 							->ext4_ext_binsearch		//最终获取到ext4_extent 
+
+ext4_da_do_write_end //标记inode、buffer_head和folio为脏，触发页面回写，更新i_size等元数据
 ```
 
 ```c
@@ -148,7 +150,83 @@ retry:
 }
 
 
+static int ext4_da_do_write_end(struct address_space *mapping,
+			loff_t pos, unsigned len, unsigned copied,
+			struct folio *folio)
+{
+	struct inode *inode = mapping->host;
+	loff_t old_size = inode->i_size;
+	bool disksize_changed = false;
+	loff_t new_i_size, zero_len = 0;
+	handle_t *handle;
 
+	if (unlikely(!folio_buffers(folio))) {
+		folio_unlock(folio);
+		folio_put(folio);
+		return -EIO;
+	}
+	/*
+	 * block_write_end() will mark the inode as dirty with I_DIRTY_PAGES
+	 * flag, which all that's needed to trigger page writeback.
+	 * 标记inode、buffer_head和folio为脏，触发页面回写
+	 */
+	copied = block_write_end(NULL, mapping, pos, len, copied,
+			folio, NULL);
+	new_i_size = pos + copied;
+
+	/*
+	 * It's important to update i_size while still holding folio lock,
+	 * because folio writeout could otherwise come in and zero beyond
+	 * i_size.
+	 在保持页锁期间更新 i_size 至关重要，否则页回写操作可能会在 i_size 之外的位置填充零值
+	 *
+	 * Since we are holding inode lock, we are sure i_disksize <=
+	 * i_size. We also know that if i_disksize < i_size, there are
+	 * delalloc writes pending in the range up to i_size. If the end of
+	 * the current write is <= i_size, there's no need to touch
+	 * i_disksize since writeback will push i_disksize up to i_size
+	 * eventually. If the end of the current write is > i_size and
+	 * inside an allocated block which ext4_da_should_update_i_disksize()
+	 * checked, we need to update i_disksize here as certain
+	 * ext4_writepages() paths not allocating blocks and update i_disksize.
+	 * 由于持有 inode 锁，可以确保 i_disksize <= i_size。
+	 * 若 i_disksize < i_size，则表明在i_disksize到i_size这段范围的内存有延迟分配的写入操作
+	 * 若当前写入的结束位置 <= i_size，则无需修改 i_disksize，因为回写机制最终会将 i_disksize 推升至 i_size。
+	 * 若当前写入的结束位置 > i_size 且位于已分配的块内（此情况已由 ext4_da_should_update_i_disksize() 检查）
+	 * 则需要在此更新 i_disksize，因为某些 ext4_writepages() 路径不会分配块但会更新 i_disksize。
+	 */
+	if (new_i_size > inode->i_size) {
+		unsigned long end;
+
+		i_size_write(inode, new_i_size);
+		end = (new_i_size - 1) & (PAGE_SIZE - 1);
+		if (copied && ext4_da_should_update_i_disksize(folio, end)) {
+			ext4_update_i_disksize(inode, new_i_size);
+			disksize_changed = true;
+		}
+	}
+
+	folio_unlock(folio);
+	folio_put(folio);
+
+	if (pos > old_size) {//写入的位置超过文件原有大小
+		pagecache_isize_extended(inode, old_size, pos);
+		zero_len = pos - old_size;
+	}
+
+	if (!disksize_changed && !zero_len)
+		return copied;
+
+	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	if (zero_len)
+		ext4_zero_partial_blocks(handle, inode, old_size, zero_len);
+	ext4_mark_inode_dirty(handle, inode);
+	ext4_journal_stop(handle);
+
+	return copied;
+}
 
 int ext4_block_write_begin(handle_t *handle, struct folio *folio,
 			   loff_t pos, unsigned len,
