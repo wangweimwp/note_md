@@ -427,3 +427,409 @@ static void stop_this_handle(handle_t *handle)
 }
 
 ```
+## jbd2_journal_get_create_access
+```c
+
+
+/*
+ * When the user wants to journal a newly created buffer_head
+ * (ie. getblk() returned a new buffer and we are going to populate it
+ * manually rather than reading off disk), then we need to keep the
+ * buffer_head locked until it has been completely filled with new
+ * data.  In this case, we should be able to make the assertion that
+ * the bh is not already part of an existing transaction.
+ *
+ * The buffer should already be locked by the caller by this point.
+ * There is no lock ranking violation: it was a newly created,
+ * unlocked buffer beforehand. */
+
+/**
+ * jbd2_journal_get_create_access () - notify intent to use newly created bh
+ * @handle: transaction to new buffer to
+ * @bh: new buffer.
+ *
+ * Call this if you create a new bh.
+ */
+int jbd2_journal_get_create_access(handle_t *handle, struct buffer_head *bh)
+{
+	transaction_t *transaction = handle->h_transaction;
+	journal_t *journal;
+	struct journal_head *jh = jbd2_journal_add_journal_head(bh);//申请journal_head并与buffer_head关联
+	int err;
+
+	jbd2_debug(5, "journal_head %p\n", jh);
+	err = -EROFS;
+	if (is_handle_aborted(handle))
+		goto out;
+	journal = transaction->t_journal;
+	err = 0;
+
+	JBUFFER_TRACE(jh, "entry");
+	/*
+	 * The buffer may already belong to this transaction due to pre-zeroing
+	 * in the filesystem's new_block code.  It may also be on the previous,
+	 * committing transaction's lists, but it HAS to be in Forget state in
+	 * that case: the transaction must have deleted the buffer for it to be
+	 * reused here.
+	 */
+	spin_lock(&jh->b_state_lock);
+	J_ASSERT_JH(jh, (jh->b_transaction == transaction ||
+		jh->b_transaction == NULL ||
+		(jh->b_transaction == journal->j_committing_transaction &&
+			  jh->b_jlist == BJ_Forget)));
+
+	/*J_ASSERT_JH,条件成立，继续执行后续代码，条件不成立输出崩溃信息*/
+	J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
+	J_ASSERT_JH(jh, buffer_locked(jh2bh(jh)));
+
+	if (jh->b_transaction == NULL) {//新申请或者已经提交完成的jh
+		/*
+		 * Previous jbd2_journal_forget() could have left the buffer
+		 * with jbddirty bit set because it was being committed. When
+		 * the commit finished, we've filed the buffer for
+		 * checkpointing and marked it dirty. Now we are reallocating
+		 * the buffer so the transaction freeing it must have
+		 * committed and so it's safe to clear the dirty bit.
+		 */
+		clear_buffer_dirty(jh2bh(jh));
+		/* first access by this transaction */
+		jh->b_modified = 0;
+
+		JBUFFER_TRACE(jh, "file as BJ_Reserved");
+		spin_lock(&journal->j_list_lock);
+		/*将jh添加到transaction的t_reserved_list列表，表明已被transaction管理，但并未修改
+		 * jh->b_jcount计数加1*/
+		__jbd2_journal_file_buffer(jh, transaction, BJ_Reserved);
+		spin_unlock(&journal->j_list_lock);
+	} else if (jh->b_transaction == journal->j_committing_transaction) {//有transaction正在处理jh
+		/* first access by this transaction */
+		jh->b_modified = 0;
+
+		JBUFFER_TRACE(jh, "set next transaction");
+		spin_lock(&journal->j_list_lock);
+		jh->b_next_transaction = transaction;//当前的transaction处理完后由handle->h_transaction接着处理
+		spin_unlock(&journal->j_list_lock);
+	}
+	spin_unlock(&jh->b_state_lock);
+
+	/*
+	 * akpm: I added this.  ext3_alloc_branch can pick up new indirect
+	 * blocks which contain freed but then revoked metadata.  We need
+	 * to cancel the revoke in case we end up freeing it yet again
+	 * and the reallocating as data - this would cause a second revoke,
+	 * which hits an assertion error.
+	 */
+	JBUFFER_TRACE(jh, "cancelling revoke");
+	jbd2_journal_cancel_revoke(handle, jh);// 现在很明显该jh是文件系统需要的了，不应该再被revoke
+out:
+	jbd2_journal_put_journal_head(jh);
+	return err;
+}
+
+
+/*
+ * A journal_head is attached to a buffer_head whenever JBD has an
+ * interest in the buffer.
+ *
+ * Whenever a buffer has an attached journal_head, its ->b_state:BH_JBD bit
+ * is set.  This bit is tested in core kernel code where we need to take
+ * JBD-specific actions.  Testing the zeroness of ->b_private is not reliable
+ * there.
+ *
+ * When a buffer has its BH_JBD bit set, its ->b_count is elevated by one.
+ *
+ * When a buffer has its BH_JBD bit set it is immune from being released by
+ * core kernel code, mainly via ->b_count.
+ *
+ * A journal_head is detached from its buffer_head when the journal_head's
+ * b_jcount reaches zero. Running transaction (b_transaction) and checkpoint
+ * transaction (b_cp_transaction) hold their references to b_jcount.
+ *
+ * Various places in the kernel want to attach a journal_head to a buffer_head
+ * _before_ attaching the journal_head to a transaction.  To protect the
+ * journal_head in this situation, jbd2_journal_add_journal_head elevates the
+ * journal_head's b_jcount refcount by one.  The caller must call
+ * jbd2_journal_put_journal_head() to undo this.
+ *
+ * So the typical usage would be:
+ *
+ *	(Attach a journal_head if needed.  Increments b_jcount)
+ *	struct journal_head *jh = jbd2_journal_add_journal_head(bh);
+ *	...
+ *      (Get another reference for transaction)
+ *	jbd2_journal_grab_journal_head(bh);
+ *	jh->b_transaction = xxx;
+ *	(Put original reference)
+ *	jbd2_journal_put_journal_head(jh);
+ */
+
+/*
+ * Give a buffer_head a journal_head.
+ *
+ * May sleep.
+ */
+struct journal_head *jbd2_journal_add_journal_head(struct buffer_head *bh)
+{
+	struct journal_head *jh;
+	struct journal_head *new_jh = NULL;
+
+repeat:
+	if (!buffer_jbd(bh))
+		new_jh = journal_alloc_journal_head();
+
+	jbd_lock_bh_journal_head(bh);//bit锁BH_JournalHead
+	if (buffer_jbd(bh)) {
+		jh = bh2jh(bh);//journal_head = bh->b_private
+	} else {
+		J_ASSERT_BH(bh,
+			(atomic_read(&bh->b_count) > 0) ||
+			(bh->b_folio && bh->b_folio->mapping));
+
+		if (!new_jh) {
+			jbd_unlock_bh_journal_head(bh);
+			goto repeat;
+		}
+
+		jh = new_jh;
+		new_jh = NULL;		/* We consumed it */
+		set_buffer_jbd(bh);//设置BH_JBD位，表示已关联journal_head
+		bh->b_private = jh;
+		jh->b_bh = bh;
+		get_bh(bh);//bh->b_count计数加1
+		BUFFER_TRACE(bh, "added journal_head");
+	}
+	jh->b_jcount++;//计数加1
+	jbd_unlock_bh_journal_head(bh);
+	if (new_jh)
+		journal_free_journal_head(new_jh);
+	return bh->b_private;
+}
+```
+
+## jbd2_journal_get_write_access
+```c
+jbd2_journal_get_write_access
+	->jbd2_journal_add_journal_head
+	->do_get_write_access
+
+/*
+ * If the buffer is already part of the current transaction, then there
+ * is nothing we need to do.  If it is already part of a prior
+ * transaction which we are still committing to disk, then we need to
+ * make sure that we do not overwrite the old copy: we do copy-out to
+ * preserve the copy going to disk.  We also account the buffer against
+ * the handle's metadata buffer credits (unless the buffer is already
+ * part of the transaction, that is).
+ *
+ */
+static int
+do_get_write_access(handle_t *handle, struct journal_head *jh,
+			int force_copy)
+{
+	struct buffer_head *bh;
+	transaction_t *transaction = handle->h_transaction;
+	journal_t *journal;
+	int error;
+	char *frozen_buffer = NULL;
+	unsigned long start_lock, time_lock;
+
+	journal = transaction->t_journal;
+
+	jbd2_debug(5, "journal_head %p, force_copy %d\n", jh, force_copy);
+
+	JBUFFER_TRACE(jh, "entry");
+repeat:
+	bh = jh2bh(jh);
+
+	/* @@@ Need to check for errors here at some point. */
+
+ 	start_lock = jiffies;
+	lock_buffer(bh);
+	spin_lock(&jh->b_state_lock);
+
+	/* If it takes too long to lock the buffer, trace it等锁等了好久 */
+	time_lock = jbd2_time_diff(start_lock, jiffies);
+	if (time_lock > HZ/10)
+		trace_jbd2_lock_buffer_stall(bh->b_bdev->bd_dev,
+			jiffies_to_msecs(time_lock));
+
+	/* We now hold the buffer lock so it is safe to query the buffer
+	 * state.  Is the buffer dirty?
+	 *
+	 * If so, there are two possibilities.  The buffer may be
+	 * non-journaled, and undergoing a quite legitimate writeback.
+	 * Otherwise, it is journaled, and we don't expect dirty buffers
+	 * in that state (the buffers should be marked JBD_Dirty
+	 * instead.)  So either the IO is being done under our own
+	 * control and this is a bug, or it's a third party IO such as
+	 * dump(8) (which may leave the buffer scheduled for read ---
+	 * ie. locked but not dirty) or tune2fs (which may actually have
+	 * the buffer dirtied, ugh.)  */
+	/* 从数据是否与磁盘一致的角度看，缓冲区可分为dirty与update两种状态。
+	 * 纳入jbd管理后，缓冲区的脏状态将由jbd管理。*/
+	if (buffer_dirty(bh) && jh->b_transaction) {
+		warn_dirty_buffer(bh);
+		/*
+		 * We need to clean the dirty flag and we must do it under the
+		 * buffer lock to be sure we don't race with running write-out.
+		 */
+		JBUFFER_TRACE(jh, "Journalling dirty buffer");
+		clear_buffer_dirty(bh);
+		/*
+		 * The buffer is going to be added to BJ_Reserved list now and
+		 * nothing guarantees jbd2_journal_dirty_metadata() will be
+		 * ever called for it. So we need to set jbddirty bit here to
+		 * make sure the buffer is dirtied and written out when the
+		 * journaling machinery is done with it.
+		 */
+		set_buffer_jbddirty(bh);
+	}
+
+	error = -EROFS;
+	if (is_handle_aborted(handle)) {
+		spin_unlock(&jh->b_state_lock);
+		unlock_buffer(bh);
+		goto out;
+	}
+	error = 0;
+
+	/*
+	 * The buffer is already part of this transaction if b_transaction or
+	 * b_next_transaction points to it
+	 */
+	if (jh->b_transaction == transaction ||//已经被当前transaction管理
+	    jh->b_next_transaction == transaction) {
+		unlock_buffer(bh);
+		goto done;
+	}
+
+	/*
+	 * this is the first time this transaction is touching this buffer,
+	 * reset the modified flag
+	 */
+	jh->b_modified = 0;
+
+	/*
+	 * If the buffer is not journaled right now, we need to make sure it
+	 * doesn't get written to disk before the caller actually commits the
+	 * new data
+	 */
+	if (!jh->b_transaction) {
+		JBUFFER_TRACE(jh, "no transaction");
+		J_ASSERT_JH(jh, !jh->b_next_transaction);
+		JBUFFER_TRACE(jh, "file as BJ_Reserved");
+		/*
+		 * Make sure all stores to jh (b_modified, b_frozen_data) are
+		 * visible before attaching it to the running transaction.
+		 * Paired with barrier in jbd2_write_access_granted()
+		 */
+		smp_wmb();
+		spin_lock(&journal->j_list_lock);
+		if (test_clear_buffer_dirty(bh)) {
+			/*
+			 * Execute buffer dirty clearing and jh->b_transaction
+			 * assignment under journal->j_list_lock locked to
+			 * prevent bh being removed from checkpoint list if
+			 * the buffer is in an intermediate state (not dirty
+			 * and jh->b_transaction is NULL).
+			 */
+			JBUFFER_TRACE(jh, "Journalling dirty buffer");
+			set_buffer_jbddirty(bh);
+		}
+		__jbd2_journal_file_buffer(jh, transaction, BJ_Reserved);
+		spin_unlock(&journal->j_list_lock);
+		unlock_buffer(bh);
+		goto done;
+	}
+	unlock_buffer(bh);
+
+	/*
+	 * If there is already a copy-out version of this buffer, then we don't
+	 * need to make another one
+	 * 该jh已经被旧的某个transaction管理了
+	 * 设置b_next_transaction的值，表示旧的transaction处理完本jh之后，
+	 * 本transaction会继续处理该jh。b_frozen_data 已经存在了，则不需要再拷贝了
+	 */
+	if (jh->b_frozen_data) {
+		JBUFFER_TRACE(jh, "has frozen data");
+		J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
+		goto attach_next;
+	}
+
+	/* 程序执行到这，说明jh属于旧的transaction
+	 */
+	JBUFFER_TRACE(jh, "owned by older transaction");
+	J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
+	J_ASSERT_JH(jh, jh->b_transaction == journal->j_committing_transaction);
+
+	/*
+	 * There is one case we have to be very careful about.  If the
+	 * committing transaction is currently writing this buffer out to disk
+	 * and has NOT made a copy-out, then we cannot modify the buffer
+	 * contents at all right now.  The essence of copy-out is that it is
+	 * the extra copy, not the primary copy, which gets journaled.  If the
+	 * primary copy is already going to disk then we cannot do copy-out
+	 * here.
+	 * 当前jh正在被commit，切未创建副本，等待
+	 */
+	if (buffer_shadow(bh)) {
+		JBUFFER_TRACE(jh, "on shadow: sleep");
+		spin_unlock(&jh->b_state_lock);
+		wait_on_bit_io(&bh->b_state, BH_Shadow, TASK_UNINTERRUPTIBLE);
+		goto repeat;
+	}
+
+	/*
+	 * Only do the copy if the currently-owning transaction still needs it.
+	 * If buffer isn't on BJ_Metadata list, the committing transaction is
+	 * past that stage (here we use the fact that BH_Shadow is set under
+	 * bh_state lock together with refiling to BJ_Shadow list and at this
+	 * point we know the buffer doesn't have BH_Shadow set).
+	 *
+	 * Subtle point, though: if this is a get_undo_access, then we will be
+	 * relying on the frozen_data to contain the new value of the
+	 * committed_data record after the transaction, so we HAVE to force the
+	 * frozen_data copy in that case.
+	 * 当前transaction任然需要修改前的数据，给数据做一个备份
+	 */
+	if (jh->b_jlist == BJ_Metadata || force_copy) {
+		JBUFFER_TRACE(jh, "generate frozen data");
+		if (!frozen_buffer) {
+			JBUFFER_TRACE(jh, "allocate memory for buffer");
+			spin_unlock(&jh->b_state_lock);
+			frozen_buffer = jbd2_alloc(jh2bh(jh)->b_size,
+						   GFP_NOFS | __GFP_NOFAIL);
+			goto repeat;
+		}
+		jh->b_frozen_data = frozen_buffer;
+		frozen_buffer = NULL;
+		jbd2_freeze_jh_data(jh);//将当前数据拷贝到frozen_buffer中
+	}
+attach_next:
+	/*
+	 * Make sure all stores to jh (b_modified, b_frozen_data) are visible
+	 * before attaching it to the running transaction. Paired with barrier
+	 * in jbd2_write_access_granted()
+	 */
+	smp_wmb();
+	jh->b_next_transaction = transaction;
+
+done:
+	spin_unlock(&jh->b_state_lock);
+
+	/*
+	 * If we are about to journal a buffer, then any revoke pending on it is
+	 * no longer valid
+	 */
+	jbd2_journal_cancel_revoke(handle, jh);
+
+out:
+	if (unlikely(frozen_buffer))	/* It's usually NULL */
+		jbd2_free(frozen_buffer, bh->b_size);
+
+	JBUFFER_TRACE(jh, "exit");
+	return error;
+}
+
+
+```
