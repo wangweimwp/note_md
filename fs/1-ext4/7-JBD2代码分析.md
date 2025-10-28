@@ -1,3 +1,7 @@
+# 问题
+
+## linux内核JBD2日志jh->b_frozen_data与jh->bcommitted_data的区别、什么时候一致、什么时候不一致？
+
 # 基本函数
 
 ## ext4_journal_start
@@ -831,5 +835,275 @@ out:
 	return error;
 }
 
+
+```
+## jbd2_journal_get_undo_access
+```c
+	
+/**
+ * jbd2_journal_get_undo_access() -  Notify intent to modify metadata with
+ *     non-rewindable consequences
+ * @handle: transaction
+ * @bh: buffer to undo
+ *
+ * Sometimes there is a need to distinguish between metadata which has
+ * been committed to disk and that which has not.  The ext3fs code uses
+ * this for freeing and allocating space, we have to make sure that we
+ * do not reuse freed space until the deallocation has been committed,
+ * since if we overwrote that space we would make the delete
+ * un-rewindable in case of a crash.
+ *
+ * To deal with that, jbd2_journal_get_undo_access requests write access to a
+ * buffer for parts of non-rewindable operations such as delete
+ * operations on the bitmaps.  The journaling code must keep a copy of
+ * the buffer's contents prior to the undo_access call until such time
+ * as we know that the buffer has definitely been committed to disk.
+ *
+ * We never need to know which transaction the committed data is part
+ * of, buffers touched here are guaranteed to be dirtied later and so
+ * will be committed to a new transaction in due course, at which point
+ * we can discard the old committed data pointer.
+ *
+ * Returns error number or 0 on success.
+ */
+int jbd2_journal_get_undo_access(handle_t *handle, struct buffer_head *bh)
+{
+	int err;
+	struct journal_head *jh;
+	char *committed_data = NULL;
+
+	if (is_handle_aborted(handle))
+		return -EROFS;
+
+	/* bh已经关联了jh，并且已经挂到了handle->h_transaction上*/
+	if (jbd2_write_access_granted(handle, bh, true))
+		return 0;
+
+	jh = jbd2_journal_add_journal_head(bh);
+	JBUFFER_TRACE(jh, "entry");
+
+	/*
+	 * Do this first --- it can drop the journal lock, so we want to
+	 * make sure that obtaining the committed_data is done
+	 * atomically wrt. completion of any outstanding commits.
+	 */
+	err = do_get_write_access(handle, jh, 1);
+	if (err)
+		goto out;
+
+repeat:
+	if (!jh->b_committed_data)
+		committed_data = jbd2_alloc(jh2bh(jh)->b_size,
+					    GFP_NOFS|__GFP_NOFAIL);
+
+	spin_lock(&jh->b_state_lock);
+	if (!jh->b_committed_data) {
+		/* Copy out the current buffer contents into the
+		 * preserved, committed copy. */
+		JBUFFER_TRACE(jh, "generate b_committed data");
+		if (!committed_data) {
+			spin_unlock(&jh->b_state_lock);
+			goto repeat;
+		}
+
+		jh->b_committed_data = committed_data;
+		committed_data = NULL;
+		memcpy(jh->b_committed_data, bh->b_data, bh->b_size);
+	}
+	spin_unlock(&jh->b_state_lock);
+out:
+	jbd2_journal_put_journal_head(jh);
+	if (unlikely(committed_data))
+		jbd2_free(committed_data, bh->b_size);
+	return err;
+}
+```
+## jbd2_journal_dirty_metadata
+
+jbd2_journal_dirty_metadata()的作用是通知jbd一个元数据块缓冲区的修改已经完成
+```c
+/**
+ * jbd2_journal_dirty_metadata() -  mark a buffer as containing dirty metadata
+ * @handle: transaction to add buffer to.
+ * @bh: buffer to mark
+ *
+ * mark dirty metadata which needs to be journaled as part of the current
+ * transaction.
+ *
+ * The buffer must have previously had jbd2_journal_get_write_access()
+ * called so that it has a valid journal_head attached to the buffer
+ * head.
+ *
+ * The buffer is placed on the transaction's metadata list and is marked
+ * as belonging to the transaction.
+ *
+ * Returns error number or 0 on success.
+ *
+ * Special care needs to be taken if the buffer already belongs to the
+ * current committing transaction (in which case we should have frozen
+ * data present for that commit).  In that case, we don't relink the
+ * buffer: that only gets done when the old transaction finally
+ * completes its commit.
+ */
+int jbd2_journal_dirty_metadata(handle_t *handle, struct buffer_head *bh)
+{
+	transaction_t *transaction = handle->h_transaction;
+	journal_t *journal;
+	struct journal_head *jh;
+	int ret = 0;
+
+	if (!buffer_jbd(bh))
+		return -EUCLEAN;
+
+	/*
+	 * We don't grab jh reference here since the buffer must be part
+	 * of the running transaction.
+	 */
+	jh = bh2jh(bh);
+	jbd2_debug(5, "journal_head %p\n", jh);
+	JBUFFER_TRACE(jh, "entry");
+
+	/*
+	 * This and the following assertions are unreliable since we may see jh
+	 * in inconsistent state unless we grab bh_state lock. But this is
+	 * crucial to catch bugs so let's do a reliable check until the
+	 * lockless handling is fully proven.
+	 */
+	if (data_race(jh->b_transaction != transaction &&
+	    jh->b_next_transaction != transaction)) {
+		spin_lock(&jh->b_state_lock);
+		J_ASSERT_JH(jh, jh->b_transaction == transaction ||
+				jh->b_next_transaction == transaction);
+		spin_unlock(&jh->b_state_lock);
+	}
+	if (jh->b_modified == 1) {
+		/* If it's in our transaction it must be in BJ_Metadata list. */
+		if (data_race(jh->b_transaction == transaction &&
+		    jh->b_jlist != BJ_Metadata)) {
+			spin_lock(&jh->b_state_lock);
+			if (jh->b_transaction == transaction &&
+			    jh->b_jlist != BJ_Metadata)
+				pr_err("JBD2: assertion failure: h_type=%u "
+				       "h_line_no=%u block_no=%llu jlist=%u\n",
+				       handle->h_type, handle->h_line_no,
+				       (unsigned long long) bh->b_blocknr,
+				       jh->b_jlist);
+			J_ASSERT_JH(jh, jh->b_transaction != transaction ||
+					jh->b_jlist == BJ_Metadata);
+			spin_unlock(&jh->b_state_lock);
+		}
+		goto out;
+	}
+
+	journal = transaction->t_journal;
+	spin_lock(&jh->b_state_lock);
+
+	if (is_handle_aborted(handle)) {
+		/*
+		 * Check journal aborting with @jh->b_state_lock locked,
+		 * since 'jh->b_transaction' could be replaced with
+		 * 'jh->b_next_transaction' during old transaction
+		 * committing if journal aborted, which may fail
+		 * assertion on 'jh->b_frozen_data == NULL'.
+		 */
+		ret = -EROFS;
+		goto out_unlock_bh;
+	}
+
+	if (jh->b_modified == 0) {
+		/*
+		 * This buffer's got modified and becoming part
+		 * of the transaction. This needs to be done
+		 * once a transaction -bzzz
+		 */
+		if (WARN_ON_ONCE(jbd2_handle_buffer_credits(handle) <= 0)) {
+			ret = -ENOSPC;
+			goto out_unlock_bh;
+		}
+		jh->b_modified = 1;//标记jh被修改
+		handle->h_total_credits--;
+	}
+
+	/*
+	 * fastpath, to avoid expensive locking.  If this buffer is already
+	 * on the running transaction's metadata list there is nothing to do.
+	 * Nobody can take it off again because there is a handle open.
+	 * I _think_ we're OK here with SMP barriers - a mistaken decision will
+	 * result in this test being false, so we go in and take the locks.
+	 * jh已经处于当前transaction上
+	 */
+	if (jh->b_transaction == transaction && jh->b_jlist == BJ_Metadata) {
+		JBUFFER_TRACE(jh, "fastpath");
+		if (unlikely(jh->b_transaction !=
+			     journal->j_running_transaction)) {
+			printk(KERN_ERR "JBD2: %s: "
+			       "jh->b_transaction (%llu, %p, %u) != "
+			       "journal->j_running_transaction (%p, %u)\n",
+			       journal->j_devname,
+			       (unsigned long long) bh->b_blocknr,
+			       jh->b_transaction,
+			       jh->b_transaction ? jh->b_transaction->t_tid : 0,
+			       journal->j_running_transaction,
+			       journal->j_running_transaction ?
+			       journal->j_running_transaction->t_tid : 0);
+			ret = -EINVAL;
+		}
+		goto out_unlock_bh;
+	}
+
+	set_buffer_jbddirty(bh);
+
+	/*
+	 * Metadata already on the current transaction list doesn't
+	 * need to be filed.  Metadata on another transaction's list must
+	 * be committing, and will be refiled once the commit completes:
+	 * leave it alone for now.
+	 * jh不在当前transaction的话必须位于正在提交的transaction或
+	 * 下一个将要commit的transaction
+	 */
+	if (jh->b_transaction != transaction) {
+		JBUFFER_TRACE(jh, "already on other transaction");
+		if (unlikely(((jh->b_transaction !=
+			       journal->j_committing_transaction)) ||
+			     (jh->b_next_transaction != transaction))) {
+			printk(KERN_ERR "jbd2_journal_dirty_metadata: %s: "
+			       "bad jh for block %llu: "
+			       "transaction (%p, %u), "
+			       "jh->b_transaction (%p, %u), "
+			       "jh->b_next_transaction (%p, %u), jlist %u\n",
+			       journal->j_devname,
+			       (unsigned long long) bh->b_blocknr,
+			       transaction, transaction->t_tid,
+			       jh->b_transaction,
+			       jh->b_transaction ?
+			       jh->b_transaction->t_tid : 0,
+			       jh->b_next_transaction,
+			       jh->b_next_transaction ?
+			       jh->b_next_transaction->t_tid : 0,
+			       jh->b_jlist);
+			WARN_ON(1);
+			ret = -EINVAL;
+		}
+		/* And this case is illegal: we can't reuse another
+		 * transaction's data buffer, ever. */
+		goto out_unlock_bh;
+	}
+
+	/* That test should have eliminated the following case: */
+	//结合jbd2_journal_commit_transaction中的jh->b_frozen_data = NULL分析？？？
+	J_ASSERT_JH(jh, jh->b_frozen_data == NULL);
+
+	JBUFFER_TRACE(jh, "file as BJ_Metadata");
+	spin_lock(&journal->j_list_lock);
+	/* 注意，本缓冲区以前可能通过journal_get_XXX_access()加入了BJ_Reserved队
+	 * 列，这里要从原队列上移除，然后加入BJ_Metadata队列*/
+	__jbd2_journal_file_buffer(jh, transaction, BJ_Metadata);
+	spin_unlock(&journal->j_list_lock);
+out_unlock_bh:
+	spin_unlock(&jh->b_state_lock);
+out:
+	JBUFFER_TRACE(jh, "exit");
+	return ret;
+}
 
 ```
