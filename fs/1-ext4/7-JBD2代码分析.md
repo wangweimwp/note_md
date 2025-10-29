@@ -1107,3 +1107,163 @@ out:
 }
 
 ```
+## jbd2_journal_revoke
+
+
+jbd在内存中设置了两个hash表用于管理被revoked的缓冲区
+```c
+struct journal_s
+{
+	……
+	spinlock_t j_revoke_lock; // 保护revoke 哈希表的自旋锁
+	struct jbd_revoke_table_s *j_revoke; // 指向journal正在使用的revoke hash table
+	struct jbd_revoke_table_s *j_revoke_table[2]; // 指向两个revoke hash table
+}
+```
+为什么jbd 要设置两个hash 表呢？这要从提交revoke 记录说起。当一个正在运行的
+transaction要提交时，与之相对应的revoke hash表也要提交。要提交revoke hash表，必须
+把其中的数据冻结起来，不再被改动。此时，为了能使jbd能够继续接收revoke记录，则需
+为journal设置另一个hash表。所以，jbd设置了两个hash表，供journal交替使用。
+
+hash表初始化见`journal_init_revoke`函数，`journal_init_revoke_table()`函数会创建给定大小的一个hash表，
+每个hash表在内存中都由一个jbd_revoke_table_s结构表示。
+```c
+/* The revoke table is just a simple hash table of revoke records. */
+struct jbd2_revoke_table_s
+{
+	/* It is conceivable that we might want a larger hash table
+	 * for recovery.  Must be a power of two. */
+	int		  hash_size;
+	int		  hash_shift;
+	struct list_head *hash_table;
+};
+```
+其中hash_size表示该hash表的大小，hash_table则指向
+一个list_head 结构数组，即hash 表。从逻辑上看，这个hash 表中保存的数据是
+`jbd_revoke_record_s`结构，但实际上，只是hash表中保存的数据是jbd_revoke_record_s.hash
+```c
+/* Each revoke record represents one single revoked block.  During
+   journal replay, this involves recording the transaction ID of the
+   last transaction to revoke this block. */
+
+struct jbd2_revoke_record_s
+{
+	struct list_head  hash;
+	tid_t		  sequence;	/* Used for recovery only */
+	unsigned long long	  blocknr;
+};
+```
+其中hash是用于将本结构链入revoke hash表的，sequence是调用revoke的transaction
+的ID，blocknr是磁盘块号
+`#define JOURNAL_REVOKE_DEFAULT_HASH 256`
+所以每个hash表都有256项，每项都是一个用struct list_head链起来的双向链表
+![](./image/38.png)
+```c
+*
+ * jbd2_journal_revoke: revoke a given buffer_head from the journal.  This
+ * prevents the block from being replayed during recovery if we take a
+ * crash after this current transaction commits.  Any subsequent
+ * metadata writes of the buffer in this transaction cancel the
+ * revoke.
+ *
+ * Note that this call may block --- it is up to the caller to make
+ * sure that there are no further calls to journal_write_metadata
+ * before the revoke is complete.  In ext3, this implies calling the
+ * revoke before clearing the block bitmap when we are deleting
+ * metadata.
+ *
+ * Revoke performs a jbd2_journal_forget on any buffer_head passed in as a
+ * parameter, but does _not_ forget the buffer_head if the bh was only
+ * found implicitly.
+ *
+ * bh_in may not be a journalled buffer - it may have come off
+ * the hash tables without an attached journal_head.
+ *
+ * If bh_in is non-zero, jbd2_journal_revoke() will decrement its b_count
+ * by one.
+ */
+
+int jbd2_journal_revoke(handle_t *handle, unsigned long long blocknr,
+		   struct buffer_head *bh_in)
+{
+	struct buffer_head *bh = NULL;
+	journal_t *journal;
+	struct block_device *bdev;
+	int err;
+
+	might_sleep();
+	if (bh_in)
+		BUFFER_TRACE(bh_in, "enter");
+
+	journal = handle->h_transaction->t_journal;
+	/*在日志superblock中设置JBD2_FEATURE_INCOMPAT_REVOKE特性*/
+	if (!jbd2_journal_set_features(journal, 0, 0, JBD2_FEATURE_INCOMPAT_REVOKE)){
+		J_ASSERT (!"Cannot set revoke feature!");
+		return -EINVAL;
+	}
+
+	bdev = journal->j_fs_dev;
+	bh = bh_in;
+
+	if (!bh) {
+		/*根据逻辑块号，从块设备中获取到bh*/
+		bh = __find_get_block(bdev, blocknr, journal->j_blocksize);
+		if (bh)
+			BUFFER_TRACE(bh, "found on hash");
+	}
+#ifdef JBD2_EXPENSIVE_CHECKING
+	else {
+		struct buffer_head *bh2;
+
+		/* If there is a different buffer_head lying around in
+		 * memory anywhere... */
+		bh2 = __find_get_block(bdev, blocknr, journal->j_blocksize);
+		if (bh2) {
+			/* ... and it has RevokeValid status... */
+			if (bh2 != bh && buffer_revokevalid(bh2))
+				/* ...then it better be revoked too,
+				 * since it's illegal to create a revoke
+				 * record against a buffer_head which is
+				 * not marked revoked --- that would
+				 * risk missing a subsequent revoke
+				 * cancel. */
+				J_ASSERT_BH(bh2, buffer_revoked(bh2));
+			put_bh(bh2);
+		}
+	}
+#endif
+
+	if (WARN_ON_ONCE(handle->h_revoke_credits <= 0)) {//revoke额度不够
+		if (!bh_in)
+			brelse(bh);
+		return -EIO;
+	}
+	/* We really ought not ever to revoke twice in a row without
+           first having the revoke cancelled: it's illegal to free a
+           block twice without allocating it in between! */
+	if (bh) {
+		if (!J_EXPECT_BH(bh, !buffer_revoked(bh),
+				 "inconsistent data on disk")) {
+			if (!bh_in)
+				brelse(bh);
+			return -EIO;//不可以连续revoke同一个bh 2次
+		}
+		set_buffer_revoked(bh);
+		set_buffer_revokevalid(bh);
+		if (bh_in) {
+			BUFFER_TRACE(bh_in, "call jbd2_journal_forget");
+			jbd2_journal_forget(handle, bh_in);//将bh之前的修改取消掉，添加到BJ_Forget队列上
+		} else {
+			BUFFER_TRACE(bh, "call brelse");
+			__brelse(bh);
+		}
+	}
+	handle->h_revoke_credits--;//revoke额度减一
+
+	jbd2_debug(2, "insert revoke for block %llu, bh_in=%p\n",blocknr, bh_in);
+	err = insert_revoke_hash(journal, blocknr,
+				handle->h_transaction->t_tid);//添加到hash表中
+	BUFFER_TRACE(bh_in, "exit");
+	return err;
+}
+```
