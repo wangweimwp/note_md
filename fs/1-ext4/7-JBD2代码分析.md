@@ -1159,7 +1159,7 @@ struct jbd2_revoke_record_s
 所以每个hash表都有256项，每项都是一个用struct list_head链起来的双向链表
 ![](./image/38.png)
 ```c
-*
+/*
  * jbd2_journal_revoke: revoke a given buffer_head from the journal.  This
  * prevents the block from being replayed during recovery if we take a
  * crash after this current transaction commits.  Any subsequent

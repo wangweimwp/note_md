@@ -120,3 +120,24 @@ alloc_pages() -> __alloc_pages_slowpath() -> shrink_node() -> shrink_slab() -> d
 ```
 
 
+# 七、应用
+```c
+struct super_block{
+	
+	struct list_lru s_dentry_lru	//文件系统superblock中也有存放目录和文件节点的lru列表
+	struct list_lru s_inode_lru
+}
+```
+
+在申请inode时，调用
+```
+new_inode
+	->new_inode_pseudo
+		->alloc_inode
+			->alloc_inode_sb
+				->kmem_cache_alloc_lru(_cache, &_sb->s_inode_lru, _gfp)
+```
+
+在申请slab同时，为slab所在的mem_cgroup初始化一个struct list_lru_memcg
+添加到_sb->s_inode_lru->xa上，为后续shrink做准备
+![](./image/92.PNG)
