@@ -1831,7 +1831,6 @@ static int ext4_da_do_write_end(struct address_space *mapping,
 ```
 # 日志回写线程
 ```c
-
 	
 /*
  * jbd2_journal_commit_transaction
@@ -2046,14 +2045,14 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 	 * Now start flushing things to disk, in the order they appear
 	 * on the transaction lists.  Data blocks go first.
 	 * 先将数据罗盘，遍历commit_transaction->t_inode_list上的inode
-	 * 最终调用ext4_do_writepages完成数据回写
+	 * 最终调用ext4_do_writepages提交写出请求给块设备层
 	 */
 	err = journal_submit_data_buffers(journal, commit_transaction);
 	if (err)
 		jbd2_journal_abort(journal, err);
 
 	blk_start_plug(&plug);
-	// 将revoke hash table中的记录写到日志中。
+	// 将revoke hash table中的记录写到日志中，flush_descriptor。
 	jbd2_journal_write_revoke_records(commit_transaction, &log_bufs);
 
 	jbd2_debug(3, "JBD2: commit phase 2b\n");
@@ -2109,7 +2108,8 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 
 		/* Make sure we have a descriptor block in which to
 		   record the metadata buffer. 
-		 * 元数据块缓冲区写入日志的格式是：描述符块、数据块、提交块
+		 * 元数据块缓冲区写入日志的格式是：描述符块、数据块（数据块保存的既可以是
+		 * 文件数据的修改信息，也可以保存的是文件元数据的修改信息）、提交块
 		 * 这里构造的descriptor 表示一个描述符块。
 		 */
 
@@ -2142,7 +2142,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 			/* Record it so that we can wait for IO
                            completion later */
 			BUFFER_TRACE(descriptor, "ph3: file as descriptor");
-			jbd2_file_log_bh(&log_bufs, descriptor);
+			jbd2_file_log_bh(&log_bufs, descriptor);//descriptor与revoke块放在同一个表中
 		}
 
 		/* Where is the buffer to be written? */
@@ -2258,7 +2258,7 @@ start_journal_io:
 			bufs = 0;
 		}
 	}
-
+	/*journal_submit_data_buffers只是提交数据区写出请求，这里等待数据区写出完成*/
 	err = journal_finish_inode_data_buffers(journal, commit_transaction);
 	if (err) {
 		printk(KERN_WARNING
@@ -2331,7 +2331,7 @@ start_journal_io:
 						    struct buffer_head,
 						    b_assoc_buffers);
 
-		wait_on_buffer(bh);
+		wait_on_buffer(bh);//等待元数据写入完成
 		cond_resched();
 
 		if (unlikely(!buffer_uptodate(bh)))
@@ -2358,7 +2358,11 @@ start_journal_io:
 		/* The metadata is now released for reuse, but we need
                    to remember it against this transaction so that when
                    we finally commit, we can do any checkpointing
-                   required. */
+                   required.
+		 * BJ_IO 队列上的缓冲区与BJ_Shadow队列上的缓冲区是一一对应的。
+		 * 每处理完一个BJ_IO队列上的缓冲区，都会将其从transaction中删除，
+		 * 并且要将在BJ_Shadow队列上对应的缓冲区移到BJ_Forget队列上。
+		 * (后边checkpoint 还要处理BJ_Forget队列)*/
 		JBUFFER_TRACE(jh, "file as BJ_Forget");
 		jbd2_journal_file_buffer(jh, commit_transaction, BJ_Forget);
 		JBUFFER_TRACE(jh, "brelse shadowed buffer");
@@ -2369,7 +2373,8 @@ start_journal_io:
 
 	jbd2_debug(3, "JBD2: commit phase 4\n");
 
-	/* Here we wait for the revoke record and descriptor record buffers */
+	/* Here we wait for the revoke record and descriptor record buffers 
+	 * 等待revoke和描述块写入完成*/
 	while (!list_empty(&log_bufs)) {
 		struct buffer_head *bh;
 
@@ -2685,5 +2690,6 @@ restart_loop:
 	spin_unlock(&journal->j_history_lock);
 }
 
-
 ```
+
+
