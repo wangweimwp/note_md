@@ -1832,6 +1832,7 @@ static int ext4_da_do_write_end(struct address_space *mapping,
 # 日志回写线程
 ```c
 	
+	
 /*
  * jbd2_journal_commit_transaction
  *
@@ -1998,7 +1999,7 @@ void jbd2_journal_commit_transaction(journal_t *journal)
 	 * Now try to drop any written-back buffers from the journal's
 	 * checkpoint lists.  We do this *before* commit because it potentially
 	 * frees some memory
-	 * 找出那些事务已经提交到日志，即数据已罗盘的事务
+	 * 找出那些事务已经提交到日志，即数据已落盘的事务
 	 * 将这些缓冲区从日志的管理列表中移除，并释放它们，从而回收日志空间
 	 */
 	spin_lock(&journal->j_list_lock);
@@ -2395,7 +2396,7 @@ start_journal_io:
 
 	if (err)
 		jbd2_journal_abort(journal, err);
-
+	/*下面开始写入commit块*/
 	jbd2_debug(3, "JBD2: commit phase 5\n");
 	write_lock(&journal->j_state_lock);
 	J_ASSERT(commit_transaction->t_state == T_COMMIT_DFLUSH);
@@ -2404,12 +2405,12 @@ start_journal_io:
 
 	if (!jbd2_has_feature_async_commit(journal)) {
 		err = journal_submit_commit_record(journal, commit_transaction,
-						&cbh, crc32_sum);
+						&cbh, crc32_sum);//构造commit块，并提交写出请求
 		if (err)
 			jbd2_journal_abort(journal, err);
 	}
 	if (cbh)
-		err = journal_wait_on_commit_record(journal, cbh);
+		err = journal_wait_on_commit_record(journal, cbh);//等待commit块写出完成
 	stats.run.rs_blocks_logged++;
 	if (jbd2_has_feature_async_commit(journal) &&
 	    journal->j_flags & JBD2_BARRIER) {
@@ -2425,7 +2426,7 @@ start_journal_io:
 	/*
 	 * Now disk caches for filesystem device are flushed so we are safe to
 	 * erase checkpointed transactions from the log by updating journal
-	 * superblock.
+	 * superblock.上述日志块落盘完成后，更新日志尾部指针
 	 */
 	if (update_tail)
 		jbd2_update_log_tail(journal, first_tid, first_block);
@@ -2477,6 +2478,8 @@ restart_loop:
 		 *
 		 * We also know that the frozen data has already fired
 		 * its triggers if they exist, so we can clear that too.
+		 * 如果该缓冲区存在受撤销保护，现在缓冲区已经提交，则冻结数据
+		 * 变成已提交数据（若jh有冻结数据，日志提交时会提交冻结数据）
 		 */
 		if (jh->b_committed_data) {
 			jbd2_free(jh->b_committed_data, bh->b_size);
@@ -2486,7 +2489,7 @@ restart_loop:
 				jh->b_frozen_data = NULL;
 				jh->b_frozen_triggers = NULL;
 			}
-		} else if (jh->b_frozen_data) {
+		} else if (jh->b_frozen_data) {//日志已提交，冻结数据无用
 			jbd2_free(jh->b_frozen_data, bh->b_size);
 			jh->b_frozen_data = NULL;
 			jh->b_frozen_triggers = NULL;
@@ -2495,6 +2498,9 @@ restart_loop:
 		spin_lock(&journal->j_list_lock);
 		cp_transaction = jh->b_cp_transaction;
 		if (cp_transaction) {
+			/* 如果该jh已经在旧的transaction的checkpoint队列上了，
+			 * 则从旧的transaction的checkpoint队列上删除，
+			 * 因为我们会把它加入到本transaction的checkpoint 队列上。*/
 			JBUFFER_TRACE(jh, "remove from old cp transaction");
 			cp_transaction->t_chp_stats.cs_dropped++;
 			__jbd2_journal_remove_checkpoint(jh);
@@ -2541,7 +2547,9 @@ restart_loop:
 				bh->b_bdev = NULL;
 			}
 		}
-
+		/* 将jh加入当前事务的checkpoint列表上
+		 * 运行到这里，bh大多情况下都设置了jbddirty位，
+		*/
 		if (buffer_jbddirty(bh)) {
 			JBUFFER_TRACE(jh, "add to new checkpointing trans");
 			__jbd2_journal_insert_checkpoint(jh, commit_transaction);
@@ -2562,6 +2570,15 @@ restart_loop:
 				try_to_free = 1;
 		}
 		JBUFFER_TRACE(jh, "refile or unfile buffer");
+		/* 如果下个事务要修改或删除这个块，则转移至下个事务的BJ_Metadata 队列（t_buffers）
+		 * 或BJ_Forget队列（t_forget）上；如果下个事务要用这个块，
+		 * 但还没做修改，则转移至BJ_Reserve 队列（t_reserved_list）
+		 * 
+		 * 如果下个事务不用这个块了，则将buffer的jbddirty标记清除，改为dirty标记，
+		 * 表示它开始由回写子系统接管；如果下个事务用它，则 jbddirty 标记不会删除，
+		 * 虽然它在当前事务 checkpoint buffer 列表上，但不会将它刷盘，
+		 * 因为它还在被 jbd2 接管，后面还可能会更新或删除
+		*/
 		drop_ref = __jbd2_journal_refile_buffer(jh);
 		spin_unlock(&jh->b_state_lock);
 		if (drop_ref)
@@ -2584,6 +2601,7 @@ restart_loop:
 	/*
 	 * Now recheck if some buffers did not get attached to the transaction
 	 * while the lock was dropped...
+	 * 在锁被释放期间，也许有进程调用了jbd2_journal_forget
 	 */
 	if (commit_transaction->t_forget) {
 		spin_unlock(&journal->j_list_lock);
@@ -2593,7 +2611,8 @@ restart_loop:
 
 	/* Add the transaction to the checkpoint list
 	 * __journal_remove_checkpoint() can not destroy transaction
-	 * under us because it is not marked as T_FINISHED yet */
+	 * under us because it is not marked as T_FINISHED yet 
+	 * 事务commit完成，进入checkpoint状态*/
 	if (journal->j_checkpoint_transactions == NULL) {
 		journal->j_checkpoint_transactions = commit_transaction;
 		commit_transaction->t_cpnext = commit_transaction;
@@ -2639,6 +2658,7 @@ restart_loop:
 	/*
 	 * weight the commit time higher than the average time so we don't
 	 * react too strongly to vast changes in the commit time
+	 * 更新统计信息，比如commit用时等
 	 */
 	if (likely(journal->j_average_commit_time))
 		journal->j_average_commit_time = (commit_time +
@@ -2662,7 +2682,8 @@ restart_loop:
 	journal->j_flags &= ~JBD2_FAST_COMMIT_ONGOING;
 	spin_lock(&journal->j_list_lock);
 	commit_transaction->t_state = T_FINISHED;
-	/* Check if the transaction can be dropped now that we are finished */
+	/* Check if the transaction can be dropped now that we are finished 
+	 * 本事务的checkpoint已经为空，完成checkpoint，则本事务使命完成可从内存中直接删除了。*/
 	if (commit_transaction->t_checkpoint_list == NULL) {
 		__jbd2_journal_drop_transaction(journal, commit_transaction);
 		jbd2_journal_free_transaction(commit_transaction);
