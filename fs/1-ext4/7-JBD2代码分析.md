@@ -2711,6 +2711,125 @@ restart_loop:
 	spin_unlock(&journal->j_history_lock);
 }
 
+
+
+/*
+ * kjournald2: The main thread function used to manage a logging device
+ * journal.
+ *
+ * This kernel thread is responsible for two things:
+ *
+ * 1) COMMIT:  Every so often we need to commit the current state of the
+ *    filesystem to disk.  The journal thread is responsible for writing
+ *    all of the metadata buffers to disk. If a fast commit is ongoing
+ *    journal thread waits until it's done and then continues from
+ *    there on.
+ *
+ * 2) CHECKPOINT: We cannot reuse a used section of the log file until all
+ *    of the data in that part of the log has been rewritten elsewhere on
+ *    the disk.  Flushing these old buffers to reclaim space in the log is
+ *    known as checkpointing, and this thread is responsible for that job.
+ */
+
+static int kjournald2(void *arg)
+{
+	journal_t *journal = arg;
+	transaction_t *transaction;
+
+	/*
+	 * Set up an interval timer which can be used to trigger a commit wakeup
+	 * after the commit interval expires
+	 */
+	timer_setup(&journal->j_commit_timer, commit_timeout, 0);
+
+	set_freezable();
+
+	/* Record that the journal thread is running */
+	journal->j_task = current;
+	wake_up(&journal->j_wait_done_commit);
+
+	/*
+	 * Make sure that no allocations from this kernel thread will ever
+	 * recurse to the fs layer because we are responsible for the
+	 * transaction commit and any fs involvement might get stuck waiting for
+	 * the trasn. commit.
+	 */
+	memalloc_nofs_save();
+
+	/*
+	 * And now, wait forever for commit wakeup events.
+	 */
+	write_lock(&journal->j_state_lock);
+
+loop:
+	if (journal->j_flags & JBD2_UNMOUNT)
+		goto end_loop;
+
+	jbd2_debug(1, "commit_sequence=%u, commit_request=%u\n",
+		journal->j_commit_sequence, journal->j_commit_request);
+
+	if (journal->j_commit_sequence != journal->j_commit_request) {
+		jbd2_debug(1, "OK, requests differ\n");
+		write_unlock(&journal->j_state_lock);
+		del_timer_sync(&journal->j_commit_timer);
+		jbd2_journal_commit_transaction(journal);
+		write_lock(&journal->j_state_lock);
+		goto loop;
+	}
+
+	/* 有进程因为日志空间不足或其他原因要执行检查点操作时，会睡眠在j_wait_done_commit队列上
+	 * 等日志被commit后再唤醒，然后将checkpoint列表上的缓存落盘（jbd2_log_do_checkpoint）*/
+	wake_up(&journal->j_wait_done_commit);
+	if (freezing(current)) {
+		/*
+		 * The simpler the better. Flushing journal isn't a
+		 * good idea, because that depends on threads that may
+		 * be already stopped.
+		 */
+		jbd2_debug(1, "Now suspending kjournald2\n");
+		write_unlock(&journal->j_state_lock);
+		try_to_freeze();
+		write_lock(&journal->j_state_lock);
+	} else {
+		/*
+		 * We assume on resume that commits are already there,
+		 * so we don't sleep
+		 */
+		DEFINE_WAIT(wait);
+
+		prepare_to_wait(&journal->j_wait_commit, &wait,
+				TASK_INTERRUPTIBLE);
+		transaction = journal->j_running_transaction;
+		if (transaction == NULL ||
+		    time_before(jiffies, transaction->t_expires)) {
+			write_unlock(&journal->j_state_lock);
+			schedule();
+			write_lock(&journal->j_state_lock);
+		}
+		finish_wait(&journal->j_wait_commit, &wait);
+	}
+
+	jbd2_debug(1, "kjournald2 wakes\n");
+
+	/*
+	 * Were we woken up by a commit wakeup event?
+	 */
+	transaction = journal->j_running_transaction;
+	if (transaction && time_after_eq(jiffies, transaction->t_expires)) {
+		journal->j_commit_request = transaction->t_tid;
+		jbd2_debug(1, "woke because of timeout\n");
+	}
+	goto loop;
+
+end_loop:
+	del_timer_sync(&journal->j_commit_timer);
+	journal->j_task = NULL;
+	wake_up(&journal->j_wait_done_commit);
+	jbd2_debug(1, "Journal thread exiting.\n");
+	write_unlock(&journal->j_state_lock);
+	return 0;
+}
+
 ```
 
 
