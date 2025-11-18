@@ -594,3 +594,430 @@ out:
 	return found;
 }
 ```
+
+
+# 后台回写
+
+![](./image/40.png)
+```c
+/*用于将mapping指向的page cache缓存写回磁盘，这个中间很重要的过程是delay allcation特性要做一些合并逻辑，尽量合并连续的块请求。*/
+static int ext4_do_writepages(struct mpage_da_data *mpd)
+{
+	struct writeback_control *wbc = mpd->wbc;
+	pgoff_t	writeback_index = 0;
+	long nr_to_write = wbc->nr_to_write;
+	int range_whole = 0;
+	int cycled = 1;
+	handle_t *handle = NULL;
+	struct inode *inode = mpd->inode;
+	struct address_space *mapping = inode->i_mapping;
+	int needed_blocks, rsv_blocks = 0, ret = 0;
+	struct ext4_sb_info *sbi = EXT4_SB(mapping->host->i_sb);
+	struct blk_plug plug;
+	bool give_up_on_write = false;
+
+	trace_ext4_writepages(inode, wbc);
+
+	/*
+	 * No pages to write? This is mainly a kludge to avoid starting
+	 * a transaction for special inodes like journal inode on last iput()
+	 * because that could violate lock ordering on umount
+	 */
+	if (!mapping->nrpages || !mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+		goto out_writepages;
+
+	/*
+	 * If the filesystem has aborted, it is read-only, so return
+	 * right away instead of dumping stack traces later on that
+	 * will obscure the real source of the problem.  We test
+	 * fs shutdown state instead of sb->s_flag's SB_RDONLY because
+	 * the latter could be true if the filesystem is mounted
+	 * read-only, and in that case, ext4_writepages should
+	 * *never* be called, so if that ever happens, we would want
+	 * the stack trace.
+	 */
+	if (unlikely(ext4_forced_shutdown(mapping->host->i_sb))) {
+		ret = -EROFS;
+		goto out_writepages;
+	}
+
+	/*
+	 * If we have inline data and arrive here, it means that
+	 * we will soon create the block for the 1st page, so
+	 * we'd better clear the inline data here.
+	 */
+	if (ext4_has_inline_data(inode)) {
+		/* Just inode will be modified... */
+		handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
+		if (IS_ERR(handle)) {
+			ret = PTR_ERR(handle);
+			goto out_writepages;
+		}
+		BUG_ON(ext4_test_inode_state(inode,
+				EXT4_STATE_MAY_INLINE_DATA));
+		ext4_destroy_inline_data(handle, inode);
+		ext4_journal_stop(handle);
+	}
+
+	/*
+	 * data=journal mode does not do delalloc so we just need to writeout /
+	 * journal already mapped buffers. On the other hand we need to commit
+	 * transaction to make data stable. We expect all the data to be
+	 * already in the journal (the only exception are DMA pinned pages
+	 * dirtied behind our back) so we commit transaction here and run the
+	 * writeback loop to checkpoint them. The checkpointing is not actually
+	 * necessary to make data persistent *but* quite a few places (extent
+	 * shifting operations, fsverity, ...) depend on being able to drop
+	 * pagecache pages after calling filemap_write_and_wait() and for that
+	 * checkpointing needs to happen.
+	 */
+	if (ext4_should_journal_data(inode)) {
+		mpd->can_map = 0;
+		if (wbc->sync_mode == WB_SYNC_ALL)
+			ext4_fc_commit(sbi->s_journal,
+				       EXT4_I(inode)->i_datasync_tid);
+	}
+	mpd->journalled_more_data = 0;
+
+	if (ext4_should_dioread_nolock(inode)) {
+		/*
+		 * We may need to convert up to one extent per block in
+		 * the page and we may dirty the inode.
+		 */
+		rsv_blocks = 1 + ext4_chunk_trans_blocks(inode,
+						PAGE_SIZE >> inode->i_blkbits);
+	}
+
+	if (wbc->range_start == 0 && wbc->range_end == LLONG_MAX)
+		range_whole = 1;
+	/* 值为 1 表示当前任务的回写范围为整个 inode，并且从上次完成的位置作为起始位置进行循环回写。
+	 * 值为 0 则根据 struct writeback_control wbc 的 range_start 以及 range_end 作为回写的范围*/
+	if (wbc->range_cyclic) {
+		writeback_index = mapping->writeback_index;
+		if (writeback_index)
+			cycled = 0;
+		mpd->first_page = writeback_index;
+		mpd->last_page = -1;
+	} else {
+		mpd->first_page = wbc->range_start >> PAGE_SHIFT;
+		mpd->last_page = wbc->range_end >> PAGE_SHIFT;
+	}
+
+	ext4_io_submit_init(&mpd->io_submit, wbc);
+retry:
+	/* 如果是主动sync调用(WB_SYNC_ALL等待数据真正落盘完成)或者wbc设置了tagged_writepages，将first-last范围的cache
+     * 页面修改成PAGECACHE_TAG_TOWRITE TAG，意味着需要回写（还没开始，开始会写的是PAGECACHE_TAG_WRITEBACK）*/
+	if (wbc->sync_mode == WB_SYNC_ALL || wbc->tagged_writepages)
+		tag_pages_for_writeback(mapping, mpd->first_page,
+					mpd->last_page);
+	//涉及块设备层的知识,主要作用是将做bio合并，构造出request,提升io效率。
+	blk_start_plug(&plug);
+
+	/*
+	 * First writeback pages that don't need mapping - we can avoid
+	 * starting a transaction unnecessarily and also avoid being blocked
+	 * in the block layer on device congestion while having transaction
+	 * started.
+	 */
+	mpd->do_map = 0;
+	mpd->scanned_until_end = 0;
+	mpd->io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+	if (!mpd->io_submit.io_end) {
+		ret = -ENOMEM;
+		goto unplug;
+	}
+	/* do_map = 0, 只针对覆盖写场景的buffer_mapped的page回写，
+	 * 这种场景下由于已经映射过物理块号，合完extent直接提交IO*/
+	ret = mpage_prepare_extent_to_map(mpd);
+	/* Unlock pages we didn't use */
+	mpage_release_unused_pages(mpd, false);
+	/* Submit prepared bio */
+	ext4_io_submit(&mpd->io_submit);
+	ext4_put_io_end_defer(mpd->io_submit.io_end);
+	mpd->io_submit.io_end = NULL;
+	if (ret < 0)
+		goto unplug;
+
+	while (!mpd->scanned_until_end && wbc->nr_to_write > 0) {
+		/* For each extent of pages we use new io_end */
+		mpd->io_submit.io_end = ext4_init_io_end(inode, GFP_KERNEL);
+		if (!mpd->io_submit.io_end) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		WARN_ON_ONCE(!mpd->can_map);
+		/*
+		 * We have two constraints: We find one extent to map and we
+		 * must always write out whole page (makes a difference when
+		 * blocksize < pagesize) so that we don't block on IO when we
+		 * try to write out the rest of the page. Journalled mode is
+		 * not supported by delalloc.
+		 */
+		BUG_ON(ext4_should_journal_data(inode));
+		needed_blocks = ext4_da_writepages_trans_blocks(inode);
+
+		/* start a new transaction */
+		handle = ext4_journal_start_with_reserve(inode,
+				EXT4_HT_WRITE_PAGE, needed_blocks, rsv_blocks);
+		if (IS_ERR(handle)) {
+			ret = PTR_ERR(handle);
+			ext4_msg(inode->i_sb, KERN_CRIT, "%s: jbd2_start: "
+			       "%ld pages, ino %lu; err %d", __func__,
+				wbc->nr_to_write, inode->i_ino, ret);
+			/* Release allocated io_end */
+			ext4_put_io_end(mpd->io_submit.io_end);
+			mpd->io_submit.io_end = NULL;
+			break;
+		}
+		mpd->do_map = 1;
+
+		trace_ext4_da_write_pages(inode, mpd->first_page, wbc);
+		/*do_map = 1,针对buffer_delay延迟回写的场景,,寻找逻辑块连续的buffer，做成一个extern*/
+		ret = mpage_prepare_extent_to_map(mpd);
+		if (!ret && mpd->map.m_len)
+			ret = mpage_map_and_submit_extent(handle, mpd,
+					&give_up_on_write);//为mpage_prepare_extent_to_map做好的一个extern映射物理块，提交回写IO请求
+		/*
+		 * Caution: If the handle is synchronous,
+		 * ext4_journal_stop() can wait for transaction commit
+		 * to finish which may depend on writeback of pages to
+		 * complete or on page lock to be released.  In that
+		 * case, we have to wait until after we have
+		 * submitted all the IO, released page locks we hold,
+		 * and dropped io_end reference (for extent conversion
+		 * to be able to complete) before stopping the handle.
+		 */
+		if (!ext4_handle_valid(handle) || handle->h_sync == 0) {
+			ext4_journal_stop(handle);
+			handle = NULL;
+			mpd->do_map = 0;
+		}
+		/* Unlock pages we didn't use */
+		mpage_release_unused_pages(mpd, give_up_on_write);
+		/* Submit prepared bio */
+		ext4_io_submit(&mpd->io_submit);
+
+		/*
+		 * Drop our io_end reference we got from init. We have
+		 * to be careful and use deferred io_end finishing if
+		 * we are still holding the transaction as we can
+		 * release the last reference to io_end which may end
+		 * up doing unwritten extent conversion.
+		 */
+		if (handle) {
+			ext4_put_io_end_defer(mpd->io_submit.io_end);
+			ext4_journal_stop(handle);
+		} else
+			ext4_put_io_end(mpd->io_submit.io_end);
+		mpd->io_submit.io_end = NULL;
+
+		if (ret == -ENOSPC && sbi->s_journal) {
+			/*
+			 * Commit the transaction which would
+			 * free blocks released in the transaction
+			 * and try again
+			 */
+			jbd2_journal_force_commit_nested(sbi->s_journal);
+			ret = 0;
+			continue;
+		}
+		/* Fatal error - ENOMEM, EIO... */
+		if (ret)
+			break;
+	}
+unplug:
+	blk_finish_plug(&plug);
+	if (!ret && !cycled && wbc->nr_to_write > 0) {
+		cycled = 1;
+		mpd->last_page = writeback_index - 1;
+		mpd->first_page = 0;
+		goto retry;
+	}
+
+	/* Update index */
+	if (wbc->range_cyclic || (range_whole && wbc->nr_to_write > 0))
+		/*
+		 * Set the writeback_index so that range_cyclic
+		 * mode will write it back later
+		 */
+		mapping->writeback_index = mpd->first_page;
+
+out_writepages:
+	trace_ext4_writepages_result(inode, wbc, ret,
+				     nr_to_write - wbc->nr_to_write);
+	return ret;
+}
+
+
+/*
+ * mpage_prepare_extent_to_map - find & lock contiguous range of dirty pages
+ * 				 needing mapping, submit mapped pages
+ *
+ * @mpd - where to look for pages
+ *
+ * Walk dirty pages in the mapping. If they are fully mapped, submit them for
+ * IO immediately. If we cannot map blocks, we submit just already mapped
+ * buffers in the page for IO and keep page dirty. When we can map blocks and
+ * we find a page which isn't mapped we start accumulating extent of buffers
+ * underlying these pages that needs mapping (formed by either delayed or
+ * unwritten buffers). We also lock the pages containing these buffers. The
+ * extent found is returned in @mpd structure (starting at mpd->lblk with
+ * length mpd->len blocks).
+ *
+ * Note that this function can attach bios to one io_end structure which are
+ * neither logically nor physically contiguous. Although it may seem as an
+ * unnecessary complication, it is actually inevitable in blocksize < pagesize
+ * case as we need to track IO to all buffers underlying a page in one io_end.
+ */
+static int mpage_prepare_extent_to_map(struct mpage_da_data *mpd)
+{
+	struct address_space *mapping = mpd->inode->i_mapping;
+	struct folio_batch fbatch;
+	unsigned int nr_folios;
+	pgoff_t index = mpd->first_page;
+	pgoff_t end = mpd->last_page;
+	xa_mark_t tag;
+	int i, err = 0;
+	int blkbits = mpd->inode->i_blkbits;
+	ext4_lblk_t lblk;
+	struct buffer_head *head;
+	handle_t *handle = NULL;
+	int bpp = ext4_journal_blocks_per_page(mpd->inode);
+
+	if (mpd->wbc->sync_mode == WB_SYNC_ALL || mpd->wbc->tagged_writepages)
+		tag = PAGECACHE_TAG_TOWRITE;
+	else
+		tag = PAGECACHE_TAG_DIRTY;
+
+	mpd->map.m_len = 0;//刚开始做extent
+	mpd->next_page = index;
+	if (ext4_should_journal_data(mpd->inode)) {
+		handle = ext4_journal_start(mpd->inode, EXT4_HT_WRITE_PAGE,
+					    bpp);
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+	}
+	folio_batch_init(&fbatch);
+	while (index <= end) {
+		nr_folios = filemap_get_folios_tag(mapping, &index, end,
+				tag, &fbatch);
+		if (nr_folios == 0)
+			break;
+
+		for (i = 0; i < nr_folios; i++) {
+			struct folio *folio = fbatch.folios[i];
+
+			/*
+			 * Accumulated enough dirty pages? This doesn't apply
+			 * to WB_SYNC_ALL mode. For integrity sync we have to
+			 * keep going because someone may be concurrently
+			 * dirtying pages, and we might have synced a lot of
+			 * newly appeared dirty pages, but have not synced all
+			 * of the old dirty pages.
+			 */
+			if (mpd->wbc->sync_mode == WB_SYNC_NONE &&
+			    mpd->wbc->nr_to_write <=
+			    mpd->map.m_len >> (PAGE_SHIFT - blkbits))
+				goto out;
+
+			/* If we can't merge this page, we are done. 
+			 * 当前的folio和添加已添加的buffer_head不连续，完成一个extent的页面添加，跳出
+			 * 此时scanned_until_end还等于0，ext4_do_writepages中的while循环条件成立*/
+			if (mpd->map.m_len > 0 && mpd->next_page != folio->index)
+				goto out;
+
+			if (handle) {
+				err = ext4_journal_ensure_credits(handle, bpp,
+								  0);
+				if (err < 0)
+					goto out;
+			}
+
+			folio_lock(folio);
+			/*
+			 * If the page is no longer dirty, or its mapping no
+			 * longer corresponds to inode we are writing (which
+			 * means it has been truncated or invalidated), or the
+			 * page is already under writeback and we are not doing
+			 * a data integrity writeback, skip the page
+			 */
+			if (!folio_test_dirty(folio) ||
+			    (folio_test_writeback(folio) &&
+			     (mpd->wbc->sync_mode == WB_SYNC_NONE)) ||
+			    unlikely(folio->mapping != mapping)) {
+				folio_unlock(folio);
+				continue;
+			}
+
+			folio_wait_writeback(folio);
+			BUG_ON(folio_test_writeback(folio));
+
+			/*
+			 * Should never happen but for buggy code in
+			 * other subsystems that call
+			 * set_page_dirty() without properly warning
+			 * the file system first.  See [1] for more
+			 * information.
+			 *
+			 * [1] https://lore.kernel.org/linux-mm/20180103100430.GE4911@quack2.suse.cz
+			 */
+			if (!folio_buffers(folio)) {
+				ext4_warning_inode(mpd->inode, "page %lu does not have buffers attached", folio->index);
+				folio_clear_dirty(folio);
+				folio_unlock(folio);
+				continue;
+			}
+
+			if (mpd->map.m_len == 0)//刚开始做extent，还没有添加页面
+				mpd->first_page = folio->index;
+			mpd->next_page = folio_next_index(folio);
+			/*
+			 * Writeout when we cannot modify metadata is simple.
+			 * Just submit the page. For data=journal mode we
+			 * first handle writeout of the page for checkpoint and
+			 * only after that handle delayed page dirtying. This
+			 * makes sure current data is checkpointed to the final
+			 * location before possibly journalling it again which
+			 * is desirable when the page is frequently dirtied
+			 * through a pin.
+			 */
+			if (!mpd->can_map) {
+				err = mpage_submit_folio(mpd, folio);
+				if (err < 0)
+					goto out;
+				/* Pending dirtying of journalled data? */
+				if (folio_test_checked(folio)) {
+					err = mpage_journal_page_buffers(handle,
+						mpd, folio);
+					if (err < 0)
+						goto out;
+					mpd->journalled_more_data = 1;
+				}
+				mpage_folio_done(mpd, folio);
+			} else {
+				/* Add all dirty buffers to mpd */
+				lblk = ((ext4_lblk_t)folio->index) <<
+					(PAGE_SHIFT - blkbits);
+				head = folio_buffers(folio);
+				err = mpage_process_page_bufs(mpd, head, head,
+						lblk);//若buffer_head是连续的，mpd->map.m_len会+1，表示添加到这个extern中，
+				if (err <= 0)
+					goto out;
+				err = 0;
+			}
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+	mpd->scanned_until_end = 1;//经过多次ext4_do_writepages的while，遍历到文件末尾
+	if (handle)
+		ext4_journal_stop(handle);
+	return 0;
+out:
+	folio_batch_release(&fbatch);
+	if (handle)
+		ext4_journal_stop(handle);
+	return err;
+}
+```

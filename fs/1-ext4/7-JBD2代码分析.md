@@ -2,6 +2,10 @@
 
 ## linux内核JBD2日志jh->b_frozen_data与jh->bcommitted_data的区别、什么时候一致、什么时候不一致？
 
+jh->b_frozen_data 用于事务提交过程中，保证写入日志的数据是事务开始时的原始、一致版本，在提交过程中有进程可能更改缓冲区数据，因此先将要提交的数据拷贝一份放到b_frozen_data中。
+jh->b_committed_data 表示这个buffer已经罗盘（提交）的数据，用于事务提交完成后，为实现“撤销”功能而保留的数据快照，若两次commit之间出现IO错误，则可以很快将buffer恢复到上次提交的状态
+当数据完成落盘（提交），b_frozen_data就完成使命，先会将b_committed_data指向b_frozen_data，b_frozen_data=NULL，然后释放b_committed_data指向的buffer
+
 # 基本函数
 
 ## ext4_journal_start
