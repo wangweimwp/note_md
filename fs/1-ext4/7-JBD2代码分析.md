@@ -2836,4 +2836,516 @@ end_loop:
 
 ```
 
+# 日志恢复
 
+```c
+
+/**
+ * jbd2_journal_recover - recovers a on-disk journal
+ * @journal: the journal to recover
+ *
+ * The primary function for recovering the log contents when mounting a
+ * journaled device.
+ *
+ * Recovery is done in three passes.  In the first pass, we look for the
+ * end of the log.  In the second, we assemble the list of revoke
+ * blocks.  In the third and final pass, we replay any un-revoked blocks
+ * in the log.
+ */
+int jbd2_journal_recover(journal_t *journal)
+{
+	int			err, err2;
+	journal_superblock_t *	sb;
+
+	struct recovery_info	info;
+
+	memset(&info, 0, sizeof(info));
+	sb = journal->j_superblock;
+
+	/*
+	 * The journal superblock's s_start field (the current log head)
+	 * is always zero if, and only if, the journal was cleanly
+	 * unmounted.
+	 */
+	if (!sb->s_start) {
+		jbd2_debug(1, "No recovery required, last transaction %d, head block %u\n",
+			  be32_to_cpu(sb->s_sequence), be32_to_cpu(sb->s_head));
+		journal->j_transaction_sequence = be32_to_cpu(sb->s_sequence) + 1;
+		journal->j_head = be32_to_cpu(sb->s_head);
+		return 0;
+	}
+	/*分三个阶段*/
+	err = do_one_pass(journal, &info, PASS_SCAN);/*日志空间是个环形结构，找到起点和终点*/
+	if (!err)
+		err = do_one_pass(journal, &info, PASS_REVOKE);/*找到revoke块，并把信息读入内存的revoke hash table*/
+	if (!err)
+		err = do_one_pass(journal, &info, PASS_REPLAY);/*根据描述符块的指示，将日志中的数据块写回到磁盘的原始位置上*/
+
+	jbd2_debug(1, "JBD2: recovery, exit status %d, "
+		  "recovered transactions %u to %u\n",
+		  err, info.start_transaction, info.end_transaction);
+	jbd2_debug(1, "JBD2: Replayed %d and revoked %d/%d blocks\n",
+		  info.nr_replays, info.nr_revoke_hits, info.nr_revokes);
+
+	/* Restart the log at the next transaction ID, thus invalidating
+	 * any existing commit records in the log. */
+	journal->j_transaction_sequence = ++info.end_transaction;
+	journal->j_head = info.head_block;
+	jbd2_debug(1, "JBD2: last transaction %d, head block %lu\n",
+		  journal->j_transaction_sequence, journal->j_head);
+
+	jbd2_journal_clear_revoke(journal);
+	err2 = sync_blockdev(journal->j_fs_dev);
+	if (!err)
+		err = err2;
+	err2 = jbd2_check_fs_dev_write_error(journal);
+	if (!err)
+		err = err2;
+	/* Make sure all replayed data is on permanent storage */
+	if (journal->j_flags & JBD2_BARRIER) {
+		err2 = blkdev_issue_flush(journal->j_fs_dev);
+		if (!err)
+			err = err2;
+	}
+	return err;
+}
+
+static int do_one_pass(journal_t *journal,
+			struct recovery_info *info, enum passtype pass)
+{
+	unsigned int		first_commit_ID, next_commit_ID;
+	unsigned long		next_log_block, head_block;
+	int			err, success = 0;
+	journal_superblock_t *	sb;
+	journal_header_t *	tmp;
+	struct buffer_head	*bh = NULL;
+	unsigned int		sequence;
+	int			blocktype;
+	__u32			crc32_sum = ~0; /* Transactional Checksums */
+	bool			need_check_commit_time = false;
+	__u64			last_trans_commit_time = 0, commit_time;
+
+	/*
+	 * First thing is to establish what we expect to find in the log
+	 * (in terms of transaction IDs), and where (in terms of log
+	 * block offsets): query the superblock.
+	 */
+
+	sb = journal->j_superblock;
+	next_commit_ID = be32_to_cpu(sb->s_sequence);
+	next_log_block = be32_to_cpu(sb->s_start);// next_log_block表示要在日志中读的下一个块的块号
+	head_block = next_log_block;
+
+	first_commit_ID = next_commit_ID;
+	if (pass == PASS_SCAN)
+		info->start_transaction = first_commit_ID;
+
+	jbd2_debug(1, "Starting recovery pass %d\n", pass);
+
+	/*
+	 * Now we walk through the log, transaction by transaction,
+	 * making sure that each transaction has a commit block in the
+	 * expected place.  Each complete transaction gets replayed back
+	 * into the main filesystem.
+	 */
+
+	while (1) {// 遍历所有的日志块
+		cond_resched();
+
+		/* If we already know where to stop the log traversal,
+		 * check right now that we haven't gone past the end of
+		 * the log. */
+
+		if (pass != PASS_SCAN)
+			if (tid_geq(next_commit_ID, info->end_transaction))
+				break;
+
+		jbd2_debug(2, "Scanning for sequence ID %u at %lu/%lu\n",
+			  next_commit_ID, next_log_block, journal->j_last);
+
+		/* Skip over each chunk of the transaction looking
+		 * either the next descriptor block or the final commit
+		 * record. */
+
+		jbd2_debug(3, "JBD2: checking block %ld\n", next_log_block);
+		brelse(bh);
+		bh = NULL;
+		err = jread(&bh, journal, next_log_block);// 读入日志下一个块
+		if (err)
+			goto failed;
+
+		next_log_block++;
+		wrap(journal, next_log_block);// 注意日志是个环形结构
+
+		/* What kind of buffer is it?
+		 *
+		 * If it is a descriptor block, check that it has the
+		 * expected sequence number.  Otherwise, we're all done
+		 * here. */
+
+		tmp = (journal_header_t *)bh->b_data;
+		
+		// 如果该块不是日志的描述块，则说明已经处理完了，退出
+		if (tmp->h_magic != cpu_to_be32(JBD2_MAGIC_NUMBER))
+			break;
+
+		blocktype = be32_to_cpu(tmp->h_blocktype);
+		sequence = be32_to_cpu(tmp->h_sequence);
+		jbd2_debug(3, "Found magic %d, sequence %d\n",
+			  blocktype, sequence);
+
+		if (sequence != next_commit_ID)
+			break;
+
+		/* OK, we have a valid descriptor block which matches
+		 * all of the sequence number checks.  What are we going
+		 * to do with it?  That depends on the pass... */
+
+		switch(blocktype) {
+		case JBD2_DESCRIPTOR_BLOCK:
+			/* Verify checksum first */
+			if (!jbd2_descriptor_block_csum_verify(journal,
+							       bh->b_data)) {
+				/*
+				 * PASS_SCAN can see stale blocks due to lazy
+				 * journal init. Don't error out on those yet.
+				 */
+				if (pass != PASS_SCAN) {
+					pr_err("JBD2: Invalid checksum recovering block %lu in log\n",
+					       next_log_block);
+					err = -EFSBADCRC;
+					goto failed;
+				}
+				need_check_commit_time = true;
+				jbd2_debug(1,
+					"invalid descriptor block found in %lu\n",
+					next_log_block);
+			}
+
+			/* If it is a valid descriptor block, replay it
+			 * in pass REPLAY; if journal_checksums enabled, then
+			 * calculate checksums in PASS_SCAN, otherwise,
+			 * just skip over the blocks it describes. */
+			if (pass != PASS_REPLAY) {//PASS_SCAN和PASS_REVOKE会进来
+				if (pass == PASS_SCAN &&
+				    jbd2_has_feature_checksum(journal) &&
+				    !info->end_transaction) {
+					if (calc_chksums(journal, bh,
+							&next_log_block,
+							&crc32_sum))//PASS_SCAN若开启了checksum特性，在扫描阶段就计算校验和
+						break;
+					continue;
+				}
+				//若没有开启checksum特性，跳过数据块
+				next_log_block += count_tags(journal, bh);
+				wrap(journal, next_log_block);
+				continue;
+			}
+
+			/*
+			 * A descriptor block: we can now write all of the
+			 * data blocks. Yay, useful work is finally getting
+			 * done here!
+			 */
+			err = jbd2_do_replay(journal, info, bh, &next_log_block,
+					     next_commit_ID);//PASS_SCAN时恢复数据
+			if (err) {
+				if (err == -ENOMEM)
+					goto failed;
+				success = err;
+			}
+
+			continue;
+
+		case JBD2_COMMIT_BLOCK:
+			if (pass != PASS_SCAN) {//PASS_REVOKE和PASS_REPLAY直接跳过
+				next_commit_ID++;
+				continue;
+			}
+
+			/*     How to differentiate between interrupted commit
+			 *               and journal corruption ?
+			 *如何驱动提交中断和日志损坏？假设当前是第n个事务
+			 * {nth transaction}
+			 *        Checksum Verification Failed
+			 *			 |
+			 *		 ____________________
+			 *		|		     |
+			 * 	async_commit             sync_commit
+			 *     		|                    |
+			 *		| GO TO NEXT    "Journal Corruption"
+			 *		| TRANSACTION
+			 *		|
+			 * {(n+1)th transanction}
+			 *		|
+			 * 	 _______|______________
+			 * 	|	 	      |
+			 * Commit block found	Commit block not found
+			 *      |		      |
+			 * "Journal Corruption"       |
+			 *		 _____________|_________
+			 *     		|	           	|
+			 *	nth trans corrupt	OR   nth trans
+			 *	and (n+1)th interrupted     interrupted
+			 *	before commit block
+			 *      could reach the disk.
+			 *	(Cannot find the difference in above
+			 *	 mentioned conditions. Hence assume
+			 *	 "Interrupted Commit".)
+			 */
+			commit_time = be64_to_cpu(
+				((struct commit_header *)bh->b_data)->h_commit_sec);
+			/*
+			 * If need_check_commit_time is set, it means we are in
+			 * PASS_SCAN and csum verify failed before. If
+			 * commit_time is increasing, it's the same journal,
+			 * otherwise it is stale journal block, just end this
+			 * recovery.
+			 */
+			if (need_check_commit_time) {
+				if (commit_time >= last_trans_commit_time) {
+					pr_err("JBD2: Invalid checksum found in transaction %u\n",
+					       next_commit_ID);
+					err = -EFSBADCRC;
+					goto failed;
+				}
+			ignore_crc_mismatch:
+				/*
+				 * It likely does not belong to same journal,
+				 * just end this recovery with success.
+				 */
+				jbd2_debug(1, "JBD2: Invalid checksum ignored in transaction %u, likely stale data\n",
+					  next_commit_ID);
+				goto done;
+			}
+
+			/*
+			 * Found an expected commit block: if checksums
+			 * are present, verify them in PASS_SCAN; else not
+			 * much to do other than move on to the next sequence
+			 * number.
+			 */
+			if (jbd2_has_feature_checksum(journal)) {
+				struct commit_header *cbh =
+					(struct commit_header *)bh->b_data;
+				unsigned found_chksum =
+					be32_to_cpu(cbh->h_chksum[0]);
+
+				if (info->end_transaction) {
+					journal->j_failed_commit =
+						info->end_transaction;
+					break;
+				}
+
+				/* Neither checksum match nor unused? */
+				if (!((crc32_sum == found_chksum &&
+				       cbh->h_chksum_type ==
+						JBD2_CRC32_CHKSUM &&
+				       cbh->h_chksum_size ==
+						JBD2_CRC32_CHKSUM_SIZE) ||
+				      (cbh->h_chksum_type == 0 &&
+				       cbh->h_chksum_size == 0 &&
+				       found_chksum == 0)))
+					goto chksum_error;
+
+				crc32_sum = ~0;
+				goto chksum_ok;
+			}
+
+			if (jbd2_commit_block_csum_verify(journal, bh->b_data))
+				goto chksum_ok;
+
+			if (jbd2_commit_block_csum_verify_partial(journal,
+								  bh->b_data)) {
+				pr_notice("JBD2: Find incomplete commit block in transaction %u block %lu\n",
+					  next_commit_ID, next_log_block);
+				goto chksum_ok;
+			}
+
+chksum_error:
+			if (commit_time < last_trans_commit_time)
+				goto ignore_crc_mismatch;
+			info->end_transaction = next_commit_ID;
+			info->head_block = head_block;
+
+			if (!jbd2_has_feature_async_commit(journal)) {
+				journal->j_failed_commit = next_commit_ID;//校验不通过，同事是同步提交，则判断日志损坏
+				break;
+			}
+
+chksum_ok:	//继续扫描n+1个事务
+			last_trans_commit_time = commit_time;
+			head_block = next_log_block;
+			next_commit_ID++;
+			continue;
+
+		case JBD2_REVOKE_BLOCK:
+			/*
+			 * Check revoke block crc in pass_scan, if csum verify
+			 * failed, check commit block time later.
+			 */
+			if (pass == PASS_SCAN &&
+			    !jbd2_descriptor_block_csum_verify(journal,
+							       bh->b_data)) {
+				jbd2_debug(1, "JBD2: invalid revoke block found in %lu\n",
+					  next_log_block);
+				need_check_commit_time = true;
+			}
+
+			/* If we aren't in the REVOKE pass, then we can
+			 * just skip over this block. */
+			if (pass != PASS_REVOKE)
+				continue;
+
+			err = scan_revoke_records(journal, bh,
+						  next_commit_ID, info);//PASS_REVOKE时将revoke数据缓存到内存中
+			if (err)
+				goto failed;
+			continue;
+
+		default:
+			jbd2_debug(3, "Unrecognised magic %d, end of scan.\n",
+				  blocktype);
+			goto done;
+		}
+	}
+
+ done:
+	brelse(bh);
+	/*
+	 * We broke out of the log scan loop: either we came to the
+	 * known end of the log or we found an unexpected block in the
+	 * log.  If the latter happened, then we know that the "current"
+	 * transaction marks the end of the valid log.
+	 */
+
+	if (pass == PASS_SCAN) {
+		if (!info->end_transaction)
+			info->end_transaction = next_commit_ID;
+		if (!info->head_block)
+			info->head_block = head_block;
+	} else {
+		/* It's really bad news if different passes end up at
+		 * different places (but possible due to IO errors). */
+		if (info->end_transaction != next_commit_ID) {
+			printk(KERN_ERR "JBD2: recovery pass %d ended at "
+				"transaction %u, expected %u\n",
+				pass, next_commit_ID, info->end_transaction);
+			if (!success)
+				success = -EIO;
+		}
+	}
+
+	if (jbd2_has_feature_fast_commit(journal) &&  pass != PASS_REVOKE) {
+		err = fc_do_one_pass(journal, info, pass);
+		if (err)
+			success = err;
+	}
+
+	return success;
+
+ failed:
+	brelse(bh);
+	return err;
+}
+
+
+static __always_inline int jbd2_do_replay(journal_t *journal,
+					  struct recovery_info *info,
+					  struct buffer_head *bh,
+					  unsigned long *next_log_block,
+					  unsigned int next_commit_ID)
+{
+	char *tagp;
+	int flags;
+	int ret = 0;
+	int tag_bytes = journal_tag_bytes(journal);
+	int descr_csum_size = 0;
+	unsigned long io_block;
+	journal_block_tag_t tag;
+	struct buffer_head *obh;
+	struct buffer_head *nbh;
+
+	if (jbd2_journal_has_csum_v2or3(journal))
+		descr_csum_size = sizeof(struct jbd2_journal_block_tail);
+
+	tagp = &bh->b_data[sizeof(journal_header_t)];//跳过journal_header_t，后边是tag数组
+	while (tagp - bh->b_data + tag_bytes <=
+	       journal->j_blocksize - descr_csum_size) {
+		int err;
+
+		memcpy(&tag, tagp, sizeof(tag));//从数组中取出一个tag
+		flags = be16_to_cpu(tag.t_flags);
+
+		io_block = (*next_log_block)++;//收个block存放描述块，后边数据块
+		wrap(journal, *next_log_block);
+		err = jread(&obh, journal, io_block);
+		if (err) {
+			/* Recover what we can, but report failure at the end. */
+			ret = err;
+			pr_err("JBD2: IO error %d recovering block %lu in log\n",
+			      err, io_block);
+		} else {
+			unsigned long long blocknr;
+
+			J_ASSERT(obh != NULL);
+			blocknr = read_tag_block(journal, &tag);
+
+			/* If the block has been revoked, then we're all done here. 
+			 * 根据revoke机制判断这个block是否需要恢复*/
+			if (jbd2_journal_test_revoke(journal, blocknr,
+						     next_commit_ID)) {
+				brelse(obh);
+				++info->nr_revoke_hits;
+				goto skip_write;
+			}
+
+			/* Look for block corruption */
+			if (!jbd2_block_tag_csum_verify(journal, &tag,
+					(journal_block_tag3_t *)tagp,
+					obh->b_data, next_commit_ID)) {
+				brelse(obh);
+				ret = -EFSBADCRC;
+				pr_err("JBD2: Invalid checksum recovering data block %llu in journal block %lu\n",
+				      blocknr, io_block);
+				goto skip_write;
+			}
+
+			/* Find a buffer for the new data being restored */
+			nbh = __getblk(journal->j_fs_dev, blocknr,
+				       journal->j_blocksize);//读入blocknr对应的缓冲区
+			if (nbh == NULL) {
+				pr_err("JBD2: Out of memory during recovery.\n");
+				brelse(obh);
+				return -ENOMEM;
+			}
+
+			lock_buffer(nbh);
+			memcpy(nbh->b_data, obh->b_data, journal->j_blocksize);//将日志区数据拷贝到文件系统区
+			if (flags & JBD2_FLAG_ESCAPE) {
+				*((__be32 *)nbh->b_data) =
+				cpu_to_be32(JBD2_MAGIC_NUMBER);
+			}
+
+			BUFFER_TRACE(nbh, "marking dirty");
+			set_buffer_uptodate(nbh);
+			mark_buffer_dirty(nbh);//标记为脏
+			BUFFER_TRACE(nbh, "marking uptodate");
+			++info->nr_replays;
+			unlock_buffer(nbh);
+			brelse(obh);
+			brelse(nbh);
+		}
+
+skip_write:
+		tagp += tag_bytes;//准备读取下一个tag
+		if (!(flags & JBD2_FLAG_SAME_UUID))
+			tagp += 16;
+
+		if (flags & JBD2_FLAG_LAST_TAG)
+			break;
+	}
+
+	return ret;
+}
+```
