@@ -978,7 +978,26 @@ ext4中使用ee_len的最高bit来区分written/unwritten
 ## 回写函数
 ![](./image/40.png)
 ```c
-/*用于将mapping指向的page cache缓存写回磁盘，这个中间很重要的过程是delay allcation特性要做一些合并逻辑，尽量合并连续的块请求。*/
+ext4_do_writepages
+	->mpage_prepare_extent_to_map//第一次调用
+		->mpage_process_page_bufs
+			->mpage_submit_folio
+				->mpage_submit_folio
+				->ext4_bio_write_folio
+					->clear_buffer_dirty	//前清除buffer head脏标记
+					->__folio_start_writeback	
+						->folio_test_set_writeback//设置folio writeback标记
+					->io_submit_add_bh//将buffer head添加到BIO
+	->ext4_io_submit//发出IO请求
+	->mpage_prepare_extent_to_map//第二次调用
+		->mpage_submit_folio
+	or	->mpage_process_page_bufs
+			->mpage_add_bh_to_extent
+				->map->m_len++;//表示将当前buffer head添加到这个externt中
+	->mpage_map_and_submit_extent
+
+/*用于将mapping指向的page cache缓存写回磁盘，这个中间很重要的过程是delay allcation特性要做一些合并逻辑，
+尽量合并连续的块请求。*/
 static int ext4_do_writepages(struct mpage_da_data *mpd)
 {
 	struct writeback_control *wbc = mpd->wbc;
@@ -1397,5 +1416,126 @@ out:
 	if (handle)
 		ext4_journal_stop(handle);
 	return err;
+}
+
+
+/*
+ * mpage_process_page_bufs - submit page buffers for IO or add them to extent
+ *
+ * @mpd - extent of blocks for mapping
+ * @head - the first buffer in the page
+ * @bh - buffer we should start processing from
+ * @lblk - logical number of the block in the file corresponding to @bh
+ *
+ * Walk through page buffers from @bh upto @head (exclusive) and either submit
+ * the page for IO if all buffers in this page were mapped and there's no
+ * accumulated extent of buffers to map or add buffers in the page to the
+ * extent of buffers to map. The function returns 1 if the caller can continue
+ * by processing the next page, 0 if it should stop adding buffers to the
+ * extent to map because we cannot extend it anymore. It can also return value
+ * < 0 in case of error during IO submission.
+ */
+static int mpage_process_page_bufs(struct mpage_da_data *mpd,
+				   struct buffer_head *head,
+				   struct buffer_head *bh,
+				   ext4_lblk_t lblk)
+{
+	struct inode *inode = mpd->inode;
+	int err;
+	ext4_lblk_t blocks = (i_size_read(inode) + i_blocksize(inode) - 1)
+							>> inode->i_blkbits;//文件边界
+
+	if (ext4_verity_in_progress(inode))
+		blocks = EXT_MAX_BLOCKS;
+
+	do {
+		BUG_ON(buffer_locked(bh));
+
+		/* 超过边界或者mpage_add_bh_to_extent返回0
+		 * 首次调用 mpage_prepare_extent_to_map处理覆盖写dirty page：
+		 * do_map = 0,会一直循环寻找可以合并的连续page cache，
+		 * 如果mpage_process_page_bufs返回0，代码停止将page cache继续向extent添加；
+		 * 返回1表示继续寻找后续的page cache看是否能添加到extent中。
+		 * mpage_add_bh_to_extent返回true， mpage_process_page_bufs进入mpd->map.m_len ==0，
+		 * 然后mpage_submit_page将buffer head添加到BIO。*/
+		if (lblk >= blocks || !mpage_add_bh_to_extent(mpd, lblk, bh)) {
+			/* Found extent to map? */
+			if (mpd->map.m_len)
+				return 0;
+			/* Buffer needs mapping and handle is not started? */
+			if (!mpd->do_map)
+				return 0;
+			/* Everything mapped so far and we hit EOF */
+			break;
+		}
+	} while (lblk++, (bh = bh->b_this_page) != head);//超过文件边界或这个folio里的bh轮训完
+	/* So far everything mapped? Submit the page for IO. */
+	if (mpd->map.m_len == 0) {
+		err = mpage_submit_folio(mpd, head->b_folio);
+		if (err < 0)
+			return err;
+		mpage_folio_done(mpd, head->b_folio);
+	}
+	if (lblk >= blocks) {
+		mpd->scanned_until_end = 1;
+		return 0;
+	}
+	return 1;
+}
+
+
+/*
+ * mpage_add_bh_to_extent - try to add bh to extent of blocks to map
+ *
+ * @mpd - extent of blocks
+ * @lblk - logical number of the block in the file
+ * @bh - buffer head we want to add to the extent
+ *
+ * The function is used to collect contig. blocks in the same state. If the
+ * buffer doesn't require mapping for writeback and we haven't started the
+ * extent of buffers to map yet, the function returns 'true' immediately - the
+ * caller can write the buffer right away. Otherwise the function returns true
+ * if the block has been added to the extent, false if the block couldn't be
+ * added.
+ */
+static bool mpage_add_bh_to_extent(struct mpage_da_data *mpd, ext4_lblk_t lblk,
+				   struct buffer_head *bh)
+{
+	struct ext4_map_blocks *map = &mpd->map;
+
+	/* Buffer that doesn't need mapping for writeback? */
+	if (!buffer_dirty(bh) || !buffer_mapped(bh) ||
+	    (!buffer_delay(bh) && !buffer_unwritten(bh))) {
+		/* So far no extent to map => we write the buffer right away 
+		 * 首次调用， 假设现在有覆盖写场景的dirty page，其状态会是：buffer_dirty和buffer_mapped, 
+		 * !buffer_delay和！buffer_unwritten。代码逻辑进入mpage_add_bh_to_extent中，
+		 * 会走到map->m_len ==0 返回true。*/
+		if (map->m_len == 0)
+			return true;
+		return false;
+	}
+
+	/* First block in the extent? */
+	if (map->m_len == 0) {
+		/* We cannot map unless handle is started... */
+		if (!mpd->do_map)
+			return false;
+		map->m_lblk = lblk;
+		map->m_len = 1;
+		map->m_flags = bh->b_state & BH_FLAGS;
+		return true;
+	}
+
+	/* Don't go larger than mballoc is willing to allocate */
+	if (map->m_len >= MAX_WRITEPAGES_EXTENT_LEN)
+		return false;
+
+	/* Can we merge the block to our big extent? */
+	if (lblk == map->m_lblk + map->m_len &&
+	    (bh->b_state & BH_FLAGS) == map->m_flags) {
+		map->m_len++;
+		return true;
+	}
+	return false;
 }
 ```
