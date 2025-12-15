@@ -17,7 +17,7 @@ ext4_file_write_iter
 						->iomap_dio_submit_bio
 							->submit_bio//提交bio请求
 			->iomap_dio_complete
-				->dops->end_io	ext4_dio_write_end_io	
+				->dops->end_io	ext4_dio_write_end_io	//文件inode标记为脏
 
 
 ext4_iomap_begin
@@ -31,7 +31,9 @@ or	->ext4_map_blocks
 			->ext4_es_lookup_extent
 			->ext4_es_insert_extent
 	->ext4_set_iomap
-		
+
+//iomap机制主要依赖iomap_iter建立磁盘块映射和向前迭代，然后通过iov_iter与BIO向映射好的块写数据
+
 //通用
 struct iomap {
 	u64			addr; /* disk offset of mapping, bytes */
@@ -497,5 +499,197 @@ out_free_dio:
 	if (ret)
 		return ERR_PTR(ret);
 	return NULL;
+}
+
+
+
+static loff_t iomap_dio_bio_iter(const struct iomap_iter *iter,
+		struct iomap_dio *dio)
+{
+	const struct iomap *iomap = &iter->iomap;
+	struct inode *inode = iter->inode;
+	unsigned int fs_block_size = i_blocksize(inode), pad;
+	const loff_t length = iomap_length(iter);
+	bool atomic = iter->flags & IOMAP_ATOMIC;
+	loff_t pos = iter->pos;
+	blk_opf_t bio_opf;
+	struct bio *bio;
+	bool need_zeroout = false;
+	bool use_fua = false;
+	int nr_pages, ret = 0;
+	size_t copied = 0;
+	size_t orig_count;
+
+	if (atomic && length != fs_block_size)
+		return -EINVAL;
+
+	if ((pos | length) & (bdev_logical_block_size(iomap->bdev) - 1) ||
+	    !bdev_iter_is_aligned(iomap->bdev, dio->submit.iter))
+		return -EINVAL;
+
+	if (iomap->type == IOMAP_UNWRITTEN) {
+		dio->flags |= IOMAP_DIO_UNWRITTEN;
+		need_zeroout = true;
+	}
+
+	if (iomap->flags & IOMAP_F_SHARED)
+		dio->flags |= IOMAP_DIO_COW;/*文件系统写时复制，即不覆盖原有数据块，新分配块写入数据，
+									 即保留原数据也保留新数据，多用于文件快照和共享文件*/
+
+	if (iomap->flags & IOMAP_F_NEW) {
+		need_zeroout = true;
+	} else if (iomap->type == IOMAP_MAPPED) {
+		/*
+		 * Use a FUA write if we need datasync semantics, this is a pure
+		 * data IO that doesn't require any metadata updates (including
+		 * after IO completion such as unwritten extent conversion) and
+		 * the underlying device either supports FUA or doesn't have
+		 * a volatile write cache. This allows us to avoid cache flushes
+		 * on IO completion. If we can't use writethrough and need to
+		 * sync, disable in-task completions as dio completion will
+		 * need to call generic_write_sync() which will do a blocking
+		 * fsync / cache flush call.
+		 */
+		if (!(iomap->flags & (IOMAP_F_SHARED|IOMAP_F_DIRTY)) &&
+		    (dio->flags & IOMAP_DIO_WRITE_THROUGH) &&
+		    (bdev_fua(iomap->bdev) || !bdev_write_cache(iomap->bdev)))
+			use_fua = true;
+		else if (dio->flags & IOMAP_DIO_NEED_SYNC)
+			dio->flags &= ~IOMAP_DIO_CALLER_COMP;
+	}
+
+	/*
+	 * Save the original count and trim the iter to just the extent we
+	 * are operating on right now.  The iter will be re-expanded once
+	 * we are done.
+	 * 保存原始计数，并将迭代器截取到当前正在操作的文件区段。
+	 * 操作完成后迭代器将重新扩展。
+	 */
+	orig_count = iov_iter_count(dio->submit.iter);
+	iov_iter_truncate(dio->submit.iter, length);
+
+	if (!iov_iter_count(dio->submit.iter))
+		goto out;
+
+	/*
+	 * We can only do deferred completion for pure overwrites that
+	 * don't require additional IO at completion. This rules out
+	 * writes that need zeroing or extent conversion, extend
+	 * the file size, or issue journal IO or cache flushes
+	 * during completion processing.
+	 */
+	if (need_zeroout ||
+	    ((dio->flags & IOMAP_DIO_NEED_SYNC) && !use_fua) ||
+	    ((dio->flags & IOMAP_DIO_WRITE) && pos >= i_size_read(inode)))
+		dio->flags &= ~IOMAP_DIO_CALLER_COMP;
+
+	/*
+	 * The rules for polled IO completions follow the guidelines as the
+	 * ones we set for inline and deferred completions. If none of those
+	 * are available for this IO, clear the polled flag.
+	 */
+	if (!(dio->flags & (IOMAP_DIO_INLINE_COMP|IOMAP_DIO_CALLER_COMP)))
+		dio->iocb->ki_flags &= ~IOCB_HIPRI;
+
+	if (need_zeroout) {//先将写的位置清0
+		/* zero out from the start of the block to the write offset */
+		pad = pos & (fs_block_size - 1);
+
+		ret = iomap_dio_zero(iter, dio, pos - pad, pad);
+		if (ret)
+			goto out;
+	}
+
+	bio_opf = iomap_dio_bio_opflags(dio, iomap, use_fua, atomic);
+
+	/*遍历iov_iter上的成员列表，统计总页数*/
+	nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter, BIO_MAX_VECS);
+	do {
+		size_t n;
+		if (dio->error) {
+			iov_iter_revert(dio->submit.iter, copied);
+			copied = ret = 0;
+			goto out;
+		}
+
+		bio = iomap_dio_alloc_bio(iter, dio, nr_pages, bio_opf);//申请BIO
+		fscrypt_set_bio_crypt_ctx(bio, inode, pos >> inode->i_blkbits,
+					  GFP_KERNEL);
+		bio->bi_iter.bi_sector = iomap_sector(iomap, pos);
+		bio->bi_write_hint = inode->i_write_hint;
+		bio->bi_ioprio = dio->iocb->ki_ioprio;
+		bio->bi_private = dio;
+		bio->bi_end_io = iomap_dio_bio_end_io;
+		
+		/*1,申请数组，用于存放page结构体指针
+		 *2,根据addr，将对应的页pin住，page结构体指针放到刚申请的数组中
+		 *3,iov_iter向前迭代
+		 *4,梳理bio中每个bv的bv_page,len,offset等*/
+		ret = bio_iov_iter_get_pages(bio, dio->submit.iter);
+		if (unlikely(ret)) {
+			/*
+			 * We have to stop part way through an IO. We must fall
+			 * through to the sub-block tail zeroing here, otherwise
+			 * this short IO may expose stale data in the tail of
+			 * the block we haven't written data to.
+			 */
+			bio_put(bio);
+			goto zero_tail;
+		}
+
+		n = bio->bi_iter.bi_size;
+		if (WARN_ON_ONCE(atomic && n != length)) {
+			/*
+			 * This bio should have covered the complete length,
+			 * which it doesn't, so error. We may need to zero out
+			 * the tail (complete FS block), similar to when
+			 * bio_iov_iter_get_pages() returns an error, above.
+			 */
+			ret = -EINVAL;
+			bio_put(bio);
+			goto zero_tail;
+		}
+		if (dio->flags & IOMAP_DIO_WRITE) {
+			task_io_account_write(n);
+		} else {
+			if (dio->flags & IOMAP_DIO_DIRTY)
+				bio_set_pages_dirty(bio);
+		}
+
+		dio->size += n;
+		copied += n;
+
+		nr_pages = bio_iov_vecs_to_alloc(dio->submit.iter,
+						 BIO_MAX_VECS);//iov_iter是否还有page，计算下次bio请求的页数
+		/*
+		 * We can only poll for single bio I/Os.
+		 */
+		if (nr_pages)
+			dio->iocb->ki_flags &= ~IOCB_HIPRI;
+		iomap_dio_submit_bio(iter, dio, bio, pos);//提奖当前bio发送请求
+		pos += n;
+	} while (nr_pages);//下次bio请求页数不为0，继续循环
+
+	/*
+	 * We need to zeroout the tail of a sub-block write if the extent type
+	 * requires zeroing or the write extends beyond EOF. If we don't zero
+	 * the block tail in the latter case, we can expose stale data via mmap
+	 * reads of the EOF block.
+	 */
+zero_tail:
+	if (need_zeroout ||
+	    ((dio->flags & IOMAP_DIO_WRITE) && pos >= i_size_read(inode))) {
+		/* zero out from the end of the write to the end of the block */
+		pad = pos & (fs_block_size - 1);
+		if (pad)
+			ret = iomap_dio_zero(iter, dio, pos,
+					     fs_block_size - pad);
+	}
+out:
+	/* Undo iter limitation to current extent */
+	iov_iter_reexpand(dio->submit.iter, orig_count - copied);
+	if (copied)
+		return copied;
+	return ret;
 }
 ```
