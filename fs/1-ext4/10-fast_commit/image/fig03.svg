@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 472" width="680" role="img"><style>text{font-family:'Microsoft YaHei',sans-serif;}text.th{font-size:14px;font-weight:500;}text.ts{font-size:12px;}.arr{stroke:#888780;stroke-width:1.5;fill:none;}.leader{stroke:#B4B2A9;stroke-width:0.5;stroke-dasharray:3 3;fill:none;}</style>
+<title>fast commit 提交流程</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="215" y="40" width="250" height="56" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text class="th" x="340" y="60" text-anchor="middle" dominant-baseline="central" fill="#CECBF6">文件操作时增量追踪</text>
+<text class="ts" x="340" y="78" text-anchor="middle" dominant-baseline="central" fill="#AFA9EC">ext4_fc_track_*() 记入 i_fc_list</text>
+<line class="arr" x1="340" y1="96" x2="340" y2="132" marker-end="url(#arrow)"/>
+<rect x="215" y="136" width="250" height="56" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text class="th" x="340" y="156" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4">fsync(fileA)</text>
+<text class="ts" x="340" y="174" text-anchor="middle" dominant-baseline="central" fill="#85B7EB">先落盘该文件的脏数据块（ordered 语义）</text>
+<line class="arr" x1="340" y1="192" x2="340" y2="214" marker-end="url(#arrow)"/>
+<polygon points="340,218 470,262 340,306 210,262" fill="#633806" stroke="#FAC775" stroke-width="0.5"/>
+<text x="340" y="252" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#FAEEDA">全部变更都能</text>
+<text x="340" y="272" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#FAEEDA">用 tag 表达吗</text>
+<path d="M210,262 L140,262 L140,326" fill="none" class="arr" marker-end="url(#arrow)"/>
+<text class="ts" x="170" y="250" text-anchor="middle" fill="#9FE1CB">是</text>
+<path d="M470,262 L540,262 L540,326" fill="none" class="arr" marker-end="url(#arrow)"/>
+<text class="ts" x="510" y="250" text-anchor="middle" fill="#F09595">否</text>
+<rect x="40" y="330" width="200" height="56" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text class="th" x="140" y="350" text-anchor="middle" dominant-baseline="central" fill="#9FE1CB">tags 写入 FC 区</text>
+<text class="ts" x="140" y="368" text-anchor="middle" dominant-baseline="central" fill="#5DCAA5">写 commit record 后返回</text>
+<rect x="440" y="330" width="200" height="56" rx="8" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text class="th" x="540" y="350" text-anchor="middle" dominant-baseline="central" fill="#F7C1C1">标记 ineligible</text>
+<text class="ts" x="540" y="368" text-anchor="middle" dominant-baseline="central" fill="#F09595">回退传统完整提交</text>
+<text class="ts" x="340" y="428" text-anchor="middle" fill="#B4B2A9">不可表达的操作：xattr 变更、跨目录 / 目录 rename、inline data、swapfile 等</text>
+<text class="ts" x="340" y="450" text-anchor="middle" fill="#B4B2A9">FC 区写满或 5 秒提交定时器到期也会触发完整提交，并使之前的 FC 失效、清空 FC 区</text>
+</svg>

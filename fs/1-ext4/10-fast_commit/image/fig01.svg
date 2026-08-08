@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 468" width="680" role="img"><style>text{font-family:'Microsoft YaHei',sans-serif;}text.th{font-size:14px;font-weight:500;}text.ts{font-size:12px;}.arr{stroke:#888780;stroke-width:1.5;fill:none;}.leader{stroke:#B4B2A9;stroke-width:0.5;stroke-dasharray:3 3;fill:none;}</style>
+<title>传统完整提交流程与延迟来源</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="40" width="230" height="56" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text class="th" x="155" y="60" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4">fsync(fileA)</text>
+<text class="ts" x="155" y="78" text-anchor="middle" dominant-baseline="central" fill="#85B7EB">应用强制要求落盘</text>
+<line class="arr" x1="155" y1="96" x2="155" y2="132" marker-end="url(#arrow)"/>
+<rect x="40" y="136" width="230" height="56" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text class="th" x="155" y="156" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4">事务 T 进入 committing</text>
+<text class="ts" x="155" y="174" text-anchor="middle" dominant-baseline="central" fill="#85B7EB">聚合了全局近期元数据变更</text>
+<line class="arr" x1="155" y1="192" x2="155" y2="228" marker-end="url(#arrow)"/>
+<rect x="40" y="232" width="230" height="56" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text class="th" x="155" y="252" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4">整块写入 journal</text>
+<text class="ts" x="155" y="270" text-anchor="middle" dominant-baseline="central" fill="#85B7EB">描述符块 + 全部脏元数据块 + commit 块</text>
+<line class="arr" x1="155" y1="288" x2="155" y2="324" marker-end="url(#arrow)"/>
+<rect x="40" y="328" width="230" height="44" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text class="th" x="155" y="350" text-anchor="middle" dominant-baseline="central" fill="#B5D4F4">fsync 终于返回</text>
+<rect x="310" y="40" width="330" height="332" rx="12" fill="#444441" stroke="#D3D1C7" stroke-width="0.5"/>
+<text class="th" x="330" y="74" fill="#D3D1C7">事务 T 实际携带的元数据块</text>
+<rect x="330" y="100" width="140" height="32" rx="6" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="400" y="116" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#B5D4F4">fileA inode（相关）</text>
+<rect x="480" y="100" width="140" height="32" rx="6" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text x="550" y="116" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#F7C1C1">fileB inode（无关）</text>
+<rect x="330" y="148" width="140" height="32" rx="6" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text x="400" y="164" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#F7C1C1">目录块（无关）</text>
+<rect x="480" y="148" width="140" height="32" rx="6" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text x="550" y="164" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#F7C1C1">块位图（无关）</text>
+<rect x="330" y="196" width="140" height="32" rx="6" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text x="400" y="212" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#F7C1C1">组描述符（无关）</text>
+<rect x="480" y="196" width="140" height="32" rx="6" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text x="550" y="212" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#F7C1C1">超级块（无关）</text>
+<text class="ts" x="330" y="258" fill="#B4B2A9">· JBD2 以块为粒度：改 1 字节也整块 4KB 写日志</text>
+<text class="ts" x="330" y="284" fill="#B4B2A9">· fsync 被迫等待这些无关 I/O 全部完成</text>
+<text class="ts" x="330" y="310" fill="#B4B2A9">· 一次完整提交常达数百微秒甚至毫秒级</text>
+<rect x="40" y="392" width="600" height="56" rx="8" fill="#791F1F" stroke="#F09595" stroke-width="0.5"/>
+<text class="th" x="340" y="412" text-anchor="middle" dominant-baseline="central" fill="#F7C1C1">完整提交的延迟来源</text>
+<text class="ts" x="340" y="430" text-anchor="middle" dominant-baseline="central" fill="#F09595">无关 I/O 等待 + 块级冗余拷贝 + 双写（journal → checkpoint）</text>
+</svg>

@@ -1,0 +1,40 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_fc_track_unlink tracer
+ *
+ * 追踪内核函数:
+ *   void __ext4_fc_track_unlink(handle_t *handle,
+ *                               struct inode *inode,
+ *                               struct dentry *dentry)
+ *
+ * 取出第二个参数 struct inode *inode，并打印:
+ *   EXT4_SB(inode->i_sb)->s_mount_opt2
+ *
+ * 宏展开: EXT4_SB(sb) == (struct ext4_sb_info *)(sb)->s_fs_info
+ * 因此目标值 = ((struct ext4_sb_info *)inode->i_sb->s_fs_info)->s_mount_opt2
+ *
+ * 依赖:
+ *   - 内核开启 CONFIG_BPF, CONFIG_DEBUG_INFO_BTF (用于解析 struct 成员偏移)
+ *   - /proc/kallsyms 中存在 __ext4_fc_track_unlink 符号
+ *     (若被编译器内联则无符号，可改用 kfunc 版本，见文末)
+ *   - 以 root 运行: sudo bpftrace ext4_fc_track_unlink.bt
+ */
+
+kprobe:__ext4_fc_track_unlink
+{
+    // arg1 对应第二个参数: struct inode *inode (x86-64 下为 rsi)
+    $inode = (struct inode *)arg1;
+
+    // inode->i_sb->s_fs_info 即 ext4_sb_info 指针
+    $sbi  = (struct ext4_sb_info *)$inode->i_sb->s_fs_info;
+    $opt2 = $sbi->s_mount_opt2;   // unsigned long
+
+    printf("PID %-6d %-16s __ext4_fc_track_unlink: inode=%p sbi=0x%lx s_mount_opt2=0x%lx\n",
+           pid, comm, $inode, $sbi, $opt2);
+}
+
+END
+{
+    printf("Tracing stopped.\n");
+}
+

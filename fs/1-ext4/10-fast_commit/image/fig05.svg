@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 490" width="680" role="img"><style>text{font-family:'Microsoft YaHei',sans-serif;}text.th{font-size:14px;font-weight:500;}text.ts{font-size:12px;}.arr{stroke:#888780;stroke-width:1.5;fill:none;}.leader{stroke:#B4B2A9;stroke-width:0.5;stroke-dasharray:3 3;fill:none;}</style>
+<title>fast commit 源码地图</title>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="40" y="50" width="600" height="80" rx="12" fill="#444441" stroke="#D3D1C7" stroke-width="0.5"/>
+<text class="th" x="60" y="74" fill="#D3D1C7">fs/ext4/fsync.c —— fsync / fdatasync 入口</text>
+<rect x="60" y="88" width="180" height="30" rx="6" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="150" y="103" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#B5D4F4">ext4_sync_file()</text>
+<line class="arr" x1="240" y1="103" x2="254" y2="103" marker-end="url(#arrow)"/>
+<rect x="260" y="88" width="180" height="30" rx="6" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="350" y="103" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#B5D4F4">ext4_fsync_journal()</text>
+<line class="arr" x1="350" y1="130" x2="350" y2="166" marker-end="url(#arrow)"/>
+<rect x="40" y="170" width="600" height="140" rx="12" fill="#444441" stroke="#D3D1C7" stroke-width="0.5"/>
+<text class="th" x="60" y="194" fill="#D3D1C7">fs/ext4/fast_commit.c —— 核心实现（约 2300 行）</text>
+<rect x="60" y="210" width="180" height="80" rx="8" fill="#3C3489" stroke="#AFA9EC" stroke-width="0.5"/>
+<text x="150" y="230" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#CECBF6">追踪路径</text>
+<text x="150" y="250" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#AFA9EC">ext4_fc_track_*()</text>
+<text x="150" y="268" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#AFA9EC">track_template</text>
+<rect x="250" y="210" width="180" height="80" rx="8" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="340" y="230" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#9FE1CB">提交路径</text>
+<text x="340" y="250" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5DCAA5">ext4_fc_commit()</text>
+<text x="340" y="268" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5DCAA5">perform_commit()</text>
+<rect x="440" y="210" width="180" height="80" rx="8" fill="#0C447C" stroke="#85B7EB" stroke-width="0.5"/>
+<text x="530" y="230" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#B5D4F4">重放路径</text>
+<text x="530" y="250" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#85B7EB">ext4_fc_replay()</text>
+<text x="530" y="268" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#85B7EB">replay_scan()</text>
+<path d="M340,290 L340,312 L185,312 L185,326" fill="none" class="arr" marker-end="url(#arrow)"/>
+<path d="M495,326 L495,312 L530,312 L530,294" fill="none" class="arr" marker-end="url(#arrow)"/>
+<text class="ts" x="505" y="306" fill="#B4B2A9">回调</text>
+<rect x="40" y="330" width="290" height="80" rx="12" fill="#444441" stroke="#D3D1C7" stroke-width="0.5"/>
+<text class="th" x="60" y="354" fill="#D3D1C7">fs/jbd2/commit.c</text>
+<text class="ts" x="60" y="378" fill="#B4B2A9">jbd2_fc_begin_commit()</text>
+<text class="ts" x="60" y="398" fill="#B4B2A9">jbd2_fc_end_commit(_fallback)()</text>
+<rect x="350" y="330" width="290" height="80" rx="12" fill="#444441" stroke="#D3D1C7" stroke-width="0.5"/>
+<text class="th" x="370" y="354" fill="#D3D1C7">fs/jbd2/recovery.c</text>
+<text class="ts" x="370" y="378" fill="#B4B2A9">jbd2_fc_recover()</text>
+<text class="ts" x="370" y="398" fill="#B4B2A9">逐块回调 j_fc_replay_callback</text>
+<rect x="40" y="430" width="600" height="40" rx="8" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text class="ts" x="340" y="450" text-anchor="middle" dominant-baseline="central" fill="#B4B2A9">fs/ext4/fast_commit.h —— 磁盘 TLV 格式定义（与 e2fsprogs 保持字节一致）</text>
+</svg>

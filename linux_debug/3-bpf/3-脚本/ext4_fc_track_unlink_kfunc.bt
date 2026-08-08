@@ -1,0 +1,19 @@
+#!/usr/bin/env bpftrace
+/*
+ * 备选方案: 使用 kfunc (fentry 风格) 追踪
+ *
+ * 优点: 直接用参数名 args->inode 访问，无需关心调用约定寄存器。
+ * 前提: 该函数出现在 BTF 中且未被禁止 kfunc 追踪
+ *       (CONFIG_DEBUG_INFO_BTF + 内核未将其列入 deny list)。
+ * 运行: sudo bpftrace ext4_fc_track_unlink_kfunc.bt
+ */
+
+kfunc:__ext4_fc_track_unlink
+{
+    $sbi  = (struct ext4_sb_info *)args->inode->i_sb->s_fs_info;
+    $opt2 = $sbi->s_mount_opt2;
+
+    printf("PID %-6d %-16s __ext4_fc_track_unlink: inode=%p s_mount_opt2=0x%lx\n",
+           pid, comm, args->inode, $opt2);
+}
+

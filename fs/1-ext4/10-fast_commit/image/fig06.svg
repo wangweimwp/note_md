@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 392" width="680" role="img"><style>text{font-family:'Microsoft YaHei',sans-serif;}text.th{font-size:14px;font-weight:500;}text.ts{font-size:12px;}.arr{stroke:#888780;stroke-width:1.5;fill:none;}.leader{stroke:#B4B2A9;stroke-width:0.5;stroke-dasharray:3 3;fill:none;}</style>
+<title>FC 区 TLV 字节布局</title>
+<rect x="40" y="48" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="68" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#9FE1CB">HEAD</text>
+<rect x="162" y="48" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="68" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="48" width="130" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="271" y="68" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_features · 4B</text>
+<rect x="336" y="48" width="110" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="391" y="68" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_tid · 4B</text>
+<rect x="40" y="100" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="120" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#9FE1CB">INODE</text>
+<rect x="162" y="100" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="120" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="100" width="100" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="256" y="120" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_ino · 4B</text>
+<rect x="306" y="100" width="220" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="416" y="120" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_raw_inode · 128B+（含 extra）</text>
+<rect x="40" y="152" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="172" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#9FE1CB">ADD_RANGE</text>
+<rect x="162" y="152" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="172" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="152" width="100" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="256" y="172" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_ino · 4B</text>
+<rect x="306" y="152" width="150" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="381" y="172" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_ex extent · 12B</text>
+<rect x="40" y="204" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="224" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#9FE1CB">DEL_RANGE</text>
+<rect x="162" y="204" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="224" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="204" width="90" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="251" y="224" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_ino · 4B</text>
+<rect x="296" y="204" width="90" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="341" y="224" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_lblk · 4B</text>
+<rect x="386" y="204" width="90" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="431" y="224" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_len · 4B</text>
+<rect x="40" y="256" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="276" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">CREAT/LINK/UNLK</text>
+<rect x="162" y="256" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="276" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="256" width="110" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="261" y="276" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_parent_ino · 4B</text>
+<rect x="316" y="256" width="90" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="361" y="276" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_ino · 4B</text>
+<rect x="406" y="256" width="120" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="466" y="276" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_dname · 变长</text>
+<rect x="40" y="308" width="110" height="40" rx="6" fill="#085041" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="95" y="328" text-anchor="middle" dominant-baseline="central" font-size="13" fill="#9FE1CB">TAIL</text>
+<rect x="162" y="308" width="44" height="40" fill="#444441" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="184" y="328" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#B4B2A9">tl 4B</text>
+<rect x="206" y="308" width="110" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="261" y="328" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_tid · 4B</text>
+<rect x="316" y="308" width="110" height="40" fill="#0F6E56" stroke="#5DCAA5" stroke-width="0.5"/>
+<text x="371" y="328" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#9FE1CB">fc_crc · 4B</text>
+<text class="ts" x="40" y="374" fill="#B4B2A9">另有 PAD（占位对齐用）；TAIL 的 fc_crc 是对 HEAD 起所有 tag 字节的累积 CRC32，重放时逐字节复核</text>
+</svg>
