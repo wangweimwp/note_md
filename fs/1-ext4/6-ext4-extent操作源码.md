@@ -136,6 +136,8 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 			/*
 			 * If the extent is initialized check whether the
 			 * caller wants to convert it to unwritten.
+			 * 与 WRITTEN是同一回事，在磁盘术语里就叫 "initialized extent"；两者是同一回事的两种叫法。initialized 并不是一个独立的 es type，它只是 WRITTEN 在 on-disk 上的名字
+
 				unwritten的extent的长度不可能是0
 				ee_len的MSB为0或等于0x8000则是initiakized 其他则是 unwritten
 			 */

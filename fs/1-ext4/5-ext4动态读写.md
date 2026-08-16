@@ -411,7 +411,7 @@ int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
  * delalloc extent entry if it still couldn't find any extent. Pass out
  * the mapped extent through @map and return 0 on success.
 查找请求的块并设置延迟分配（delalloc）的区段映射。
-首先尝试在不持有 i_data_sem 的情况下，于区段状态树中查找包含所请求块的区段条目；
+首先尝试在不持有 i_data_sem 的情况下，于区段状态树（内存中）中查找包含所请求块的区段条目；
 若未找到，则尝试在持有 i_data_sem 读锁的情况下查找磁盘上的区段映射；
 最后，在持有 i_data_sem 写锁的情况下再次查找，若仍未找到任何区段，则添加一个延迟分配区段条目。
 通过 @map 参数输出映射的区段信息，成功时返回 0。
@@ -964,7 +964,7 @@ unwritten
 
 unwritten extent status也是磁盘中存储的extent tree的内存中的缓存，但是和written extent status的区别在于，unwritten extent status主要用户描述fallocate syscall分配的extent。
 
-为了满足对于fallocate预分配的磁盘空间执行读操作英翻返回0的定义，一种实现时对预分配的physical block做填0处理，但是这种操作很低效，ext4中的实现是在extent tree中区分written/unwritten extent，written extent就是映射通过正常的写操作分配的physical tree,而unwritten extent则是映射通过fallocate预分配的physical block，这样read遇到unwritten extent可以返回0.
+为了满足对于fallocate预分配的磁盘空间执行读操作英翻返回0的定义，一种实现时对预分配的physical block做填0处理，但是这种操作很低效，消耗IO。为了支持 fallocate() 预分配而不必往磁盘写一堆零。fallocate 分配好物理块、把 extent 标成 UNWRITTEN（0x8000 置位），读取即返回零。等到你真正往那些逻辑块写数据时，再把它"转换"成 WRITTEN（清标志）。这样预分配几乎零 I/O，又能保证语义正确，而且，磁盘上的旧数据不会暴露出来。
 
 ext4中使用ee_len的最高bit来区分written/unwritten
 
