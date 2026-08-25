@@ -1,9 +1,260 @@
+# 结构体
+
+
+
 
 # 追踪层
 
+```c
+/*
+ * Generic fast commit tracking function. If this is the first time this we are
+ * called after a full commit, we initialize fast commit fields and then call
+ * __fc_track_fn() with update = 0. If we have already been called after a full
+ * commit, we pass update = 1. Based on that, the track function can determine
+ * if it needs to track a field for the first time or if it needs to just
+ * update the previously tracked value.
+ *
+ * If enqueue is set, this function enqueues the inode in fast commit list.
+ */
+static int ext4_fc_track_template(
+	handle_t *handle, struct inode *inode,
+	int (*__fc_track_fn)(handle_t *handle, struct inode *, void *, bool),
+	void *args, int enqueue)
+{
+	bool update = false;
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	struct ext4_sb_info *sbi = EXT4_SB(inode->i_sb);
+	tid_t tid = 0;
+	int alloc_ctx;
+	int ret;
 
+	/* i_sync_tid 记的是"上一次为这个 inode 开追踪纪元的事务号"。
+	 * 如果和当前 handle 的事务号相同 → 这是同一事务里的第二次/第 N 次改动 
+	 * → update=true（区间要合并、inode 无需重复入队）；
+	 * 不同 → 说明自上次完整提交后这是个新纪元 
+	 * → 先 ext4_fc_reset_inode（把 i_fc_lblk_start/len 清零，:206-207），
+	 * 再把纪元推进到当前 tid。这正是你前面看到的"惰性追踪"：
+	 * 区间累积、翻篇只在 tid 变化时发生。
+	*/
+	tid = handle->h_transaction->t_tid;
+	spin_lock(&ei->i_fc_lock);
+	if (tid == ei->i_sync_tid) {
+		update = true;
+	} else {
+		ext4_fc_reset_inode(inode);
+		ei->i_sync_tid = tid;
+	}
+	ret = __fc_track_fn(handle, inode, args, update);
+	spin_unlock(&ei->i_fc_lock);
+
+	/*
+	 * dentry（目录） 追踪把信息挂在全局 dentry 队列上（不入 inode 队列）；
+	 * inode/range 追踪要把 inode 挂进 s_fc_q，供 commit 时遍历
+	 */
+	if (!enqueue)//
+		return ret;
+
+	alloc_ctx = ext4_fc_lock(inode->i_sb);
+	if (list_empty(&EXT4_I(inode)->i_fc_list))
+		list_add_tail(&EXT4_I(inode)->i_fc_list,
+				(sbi->s_journal->j_flags & JBD2_FULL_COMMIT_ONGOING ||
+				 sbi->s_journal->j_flags & JBD2_FAST_COMMIT_ONGOING) ?
+				&sbi->s_fc_q[FC_Q_STAGING] :
+				&sbi->s_fc_q[FC_Q_MAIN]);
+	ext4_fc_unlock(inode->i_sb, alloc_ctx);
+
+	return ret;
+}
+```
+
+## 目录追踪
+
+```c
+//EXT4_FC_TAG_CREAT   EXT4_FC_TAG_LINK    EXT4_FC_TAG_UNLINK
+
+/* __track_fn for directory entry updates. Called with ei->i_fc_lock. */
+static int __track_dentry_update(handle_t *handle, struct inode *inode,
+				 void *arg, bool update)
+{
+	struct ext4_fc_dentry_update *node;
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	struct __track_dentry_update_args *dentry_update =
+		(struct __track_dentry_update_args *)arg;
+	struct dentry *dentry = dentry_update->dentry;
+	struct inode *dir = dentry->d_parent->d_inode;
+	struct super_block *sb = inode->i_sb;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int alloc_ctx;
+
+	spin_unlock(&ei->i_fc_lock);
+
+	if (IS_ENCRYPTED(dir)) {//加密文件系统不支持
+		ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_ENCRYPTED_FILENAME,
+					handle);
+		spin_lock(&ei->i_fc_lock);
+		return -EOPNOTSUPP;
+	}
+
+	/* 可能睡眠，所以上边必须先放 i_fc_lock（自旋锁里不能睡）*/
+	node = kmem_cache_alloc(ext4_fc_dentry_cachep, GFP_NOFS);
+	if (!node) {
+		ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_NOMEM, handle);
+		spin_lock(&ei->i_fc_lock);
+		return -ENOMEM;
+	}
+
+	node->fcd_op = dentry_update->op;
+	node->fcd_parent = dir->i_ino;
+	node->fcd_ino = inode->i_ino;
+	take_dentry_name_snapshot(&node->fcd_name, dentry);
+	INIT_LIST_HEAD(&node->fcd_dilist);
+	INIT_LIST_HEAD(&node->fcd_list);
+	alloc_ctx = ext4_fc_lock(sb);
+	/* 添加到目录更新队列中*/
+	if (sbi->s_journal->j_flags & JBD2_FULL_COMMIT_ONGOING ||
+		sbi->s_journal->j_flags & JBD2_FAST_COMMIT_ONGOING)
+		list_add_tail(&node->fcd_list,
+				&sbi->s_fc_dentry_q[FC_Q_STAGING]);
+	else
+		list_add_tail(&node->fcd_list, &sbi->s_fc_dentry_q[FC_Q_MAIN]);
+
+	/*
+	 * This helps us keep a track of all fc_dentry updates which is part of
+	 * this ext4 inode. So in case the inode is getting unlinked, before
+	 * even we get a chance to fsync, we could remove all fc_dentry
+	 * references while evicting the inode in ext4_fc_del().
+	 * Also with this, we don't need to loop over all the inodes in
+	 * sbi->s_fc_q to get the corresponding inode in
+	 * ext4_fc_commit_dentry_updates().
+	 * 当这个新建的inode 在 fsync 之前又被 unlink/evict 时，
+	 * ext4_fc_del 能顺着 i_fc_dilist 一次性摘掉所有相关 dentry 引用，
+	 * 不必遍历整个 s_fc_q 去找；commit 端 ext4_fc_commit_dentry_updates 也能直接定位。
+	 * UNLINK/LINK 不挂这条链——它们的 replay 信息只活在全局 dentry 队列里。
+	 */
+	if (dentry_update->op == EXT4_FC_TAG_CREAT) {
+		WARN_ON(!list_empty(&ei->i_fc_dilist));
+		list_add_tail(&node->fcd_dilist, &ei->i_fc_dilist);
+	}
+	ext4_fc_unlock(sb, alloc_ctx);
+	spin_lock(&ei->i_fc_lock);
+
+	return 0;
+}
+```
+
+## inode 追踪
+
+```c
+void ext4_fc_track_inode(handle_t *handle, struct inode *inode)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	wait_queue_head_t *wq;
+	int ret;
+
+	if (S_ISDIR(inode->i_mode))
+		return;
+
+	if (ext4_should_journal_data(inode)) {
+		ext4_fc_mark_ineligible(inode->i_sb,
+					EXT4_FC_REASON_INODE_JOURNAL_DATA, handle);
+		return;
+	}
+
+	if (!ext4_fc_eligible(inode->i_sb))
+		return;
+
+	/*
+	 * If we come here, we may sleep while waiting for the inode to
+	 * commit. We shouldn't be holding i_data_sem when we go to sleep since
+	 * the commit path needs to grab the lock while committing the inode.
+	 * 如果 inode 当前正被提交（EXT4_STATE_FC_COMMITTING 由 
+	 * commit 的 ext4_fc_perform_commit 置位），
+	 * 追踪方会睡在等待位上，直到 ext4_fc_cleanup 里的 wake_up_bit 唤醒
+	 */
+	lockdep_assert_not_held(&ei->i_data_sem);
+
+	while (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING)) {
+#if (BITS_PER_LONG < 64)
+		DEFINE_WAIT_BIT(wait, &ei->i_state_flags,
+				EXT4_STATE_FC_COMMITTING);
+		wq = bit_waitqueue(&ei->i_state_flags,
+				   EXT4_STATE_FC_COMMITTING);
+#else
+		DEFINE_WAIT_BIT(wait, &ei->i_flags,
+				EXT4_STATE_FC_COMMITTING);
+		wq = bit_waitqueue(&ei->i_flags,
+				   EXT4_STATE_FC_COMMITTING);
+#endif
+		prepare_to_wait(wq, &wait.wq_entry, TASK_UNINTERRUPTIBLE);
+		if (ext4_test_inode_state(inode, EXT4_STATE_FC_COMMITTING))
+			schedule();
+		finish_wait(wq, &wait.wq_entry);
+	}
+
+	/*
+	 * From this point on, this inode will not be committed either
+	 * by fast or full commit as long as the handle is open.
+	 */
+	ret = ext4_fc_track_template(handle, inode, __track_inode, NULL, 1);
+	trace_ext4_fc_track_inode(handle, inode, ret);
+}
+
+/* __track_fn for inode tracking 
+ * 它不记录任何具体改动，只是表态"这个 inode 的元数据变了，
+ * fsync 时要把它的 INODE tag 写进日志"。
+ * 区间追踪是 ext4_fc_track_range 的活，两者配合
+ */
+static int __track_inode(handle_t *handle, struct inode *inode, void *arg,
+			 bool update)
+{
+	if (update)
+		return -EEXIST;
+
+	EXT4_I(inode)->i_fc_lblk_len = 0;
+
+	return 0;
+}
+```
+
+## 数据追踪
+```c
+/* __track_fn for tracking data updates */
+static int __track_range(handle_t *handle, struct inode *inode, void *arg,
+			 bool update)
+{
+	struct ext4_inode_info *ei = EXT4_I(inode);
+	ext4_lblk_t oldstart;
+	struct __track_range_args *__arg =
+		(struct __track_range_args *)arg;
+
+	if (inode->i_ino < EXT4_FIRST_INO(inode->i_sb)) {//特殊inode走full commit
+		ext4_debug("Special inode %llu being modified\n", inode->i_ino);
+		return -ECANCELED;
+	}
+
+	oldstart = ei->i_fc_lblk_start;
+
+	/* 同一事务内再次 track（update）：把新区间外扩合并成 [min(start), max(end)] 的闭区间。
+	 * 这样一次事务里对文件不同位置的多次写，累积成一个连续区间
+	 *（即使中间有洞，也按"覆盖的边界"算），commit 时一次性编码 —— 这就是 
+	 * fast commit "自包含、按区间重建"语义的落点*/
+	if (update && ei->i_fc_lblk_len > 0) {
+		ei->i_fc_lblk_start = min(ei->i_fc_lblk_start, __arg->start);
+		ei->i_fc_lblk_len =
+			max(oldstart + ei->i_fc_lblk_len - 1, __arg->end) -
+				ei->i_fc_lblk_start + 1;
+	} else {//首次 track（!update）：直接把 [start, end] 设为追踪区间
+		ei->i_fc_lblk_start = __arg->start;
+		ei->i_fc_lblk_len = __arg->end - __arg->start + 1;
+	}
+
+	return 0;
+}
+```
 
 # 提交层
+
+**注意：ext4_sync_file 在有 journal 时只把元数据增量写进 FC 日志区（数据块走 file_write_and_wait_range 进文件区），从不在此函数内把 inode/extent 元数据写进真实文件区；真实文件区的元数据块由 ext4_sync_file 返回后 kjournald2 的 jbd2_log_do_checkpoint → __flush_batch → write_dirty_buffer 异步落到 bh->b_bdev。fsync 的"持久性"由 FC 日志区提供：崩溃后，replay 用「上一次 full commit 的 base + FC delta」重建出最终 inode 状态**
 
 ```c
 /*
@@ -286,7 +537,13 @@ static int ext4_fc_perform_commit(journal_t *journal)
 	ext4_fc_unlock(sb, alloc_ctx);
 
 	/* Step 2: Flush data for all the eligible inodes. 
-	 * 将所有inode里的脏数据罗盘（是数据，不是元数据）
+	 * 将所有inode里的脏数据落盘（是数据，不是元数据）
+	 * ext4_sync_file->file_write_and_wait_range区别在于，
+	 * file_write_and_wait_range服务fsync语义，用户 fsync() 返回即意味着他写的内容安全。
+	 * 它在任何 ext4 挂载方式下都会跑。ext4_fc_flush_data服务fast commit语义，
+	 * 确保真实数据必须在标签落盘之前已持久，否则崩溃发生，
+	 * recovery 重放时可能会指向尚未稳定的旧/垃圾数据
+	 * 二者回写的范围可能会相同。
 	*/
 	ret = ext4_fc_flush_data(journal);
 
