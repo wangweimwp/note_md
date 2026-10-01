@@ -162,3 +162,12 @@ to reduce a bit of page_alloc.c
 1，mm: page_alloc: move pm_* function into power，其中pm_suspended_storage是否可以去掉
 
 2，
+
+# 已接收的补丁
+```test
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/kernel/sched/fair.c?id=b01f2d9597250e9c4011cb78d8d46287deaa6a69
+https://patchwork.kernel.org/project/linux-mm/patch/20260514094108.2016201-7-jiangwen6@xiaomi.com/
+https://lore.kernel.org/linux-mtd/87zewxmwfa.fsf@bootlin.com/T/#me6aa5e60232b6f6ca07973a7b62882f167ff2894
+
+```
+
